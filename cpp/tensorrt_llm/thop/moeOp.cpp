@@ -135,7 +135,8 @@ class FusedMoeRunner : public torch::CustomClassHolder
 {
 public:
     static c10::intrusive_ptr<FusedMoeRunner> getInstance(c10::ScalarType activation_dtype,
-        c10::ScalarType weight_dtype, c10::ScalarType output_dtype, bool use_fp8_block_scaling, bool min_latency_mode)
+        c10::ScalarType weight_dtype, c10::ScalarType output_dtype, bool use_fp8_block_scaling, bool min_latency_mode,
+        bool use_w4afp8)
     {
         static std::mutex instance_map_mutex;
         std::lock_guard<std::mutex> lock(instance_map_mutex);
@@ -147,7 +148,7 @@ public:
         if (iter == instance_map.end())
         {
             auto instance = c10::make_intrusive<FusedMoeRunner>(
-                activation_dtype, weight_dtype, output_dtype, use_fp8_block_scaling, min_latency_mode);
+                activation_dtype, weight_dtype, output_dtype, use_fp8_block_scaling, min_latency_mode, use_w4afp8);
             instance_map[key] = instance;
             return instance;
         }
@@ -193,13 +194,14 @@ public:
     };
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_fp8_block_scaling, bool min_latency_mode)
+        bool use_fp8_block_scaling, bool min_latency_mode, bool use_w4afp8)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
         mOutputDtype = output_dtype;
         mUseFp8BlockScaling = use_fp8_block_scaling;
         mMinLatencyMode = min_latency_mode;
+        mUseW4AFp8 = use_w4afp8;
         mInnerDimMultiplier = 1;
 
         // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
@@ -242,6 +244,44 @@ public:
             }
         }
 #endif
+        if (isInt4Quant())
+        {
+            mInnerDimMultiplier = 2;
+            if (mActivationDtype == c10::ScalarType::Half)
+            {
+#ifdef ENABLE_FP8
+                if (mUseW4AFp8)
+                {
+                    mKernelRunner
+                        = std::make_unique<kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
+                }
+                else
+                {
+                    mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
+                }
+#else
+                mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
+#endif
+            }
+#ifdef ENABLE_BF16
+            else if (mActivationDtype == c10::ScalarType::BFloat16)
+            {
+#ifdef ENABLE_FP8
+                if (mUseW4AFp8)
+                {
+                    mKernelRunner = std::make_unique<
+                        kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>>();
+                }
+                else
+                {
+                    mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
+                }
+#else
+                mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
+#endif
+            }
+#endif
+        }
         if (!mKernelRunner)
         {
             C10_THROW_ERROR_FORMATTED(Error,
@@ -276,6 +316,7 @@ public:
 
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+        int64_t group_size = isInt4Quant() ? 128 : -1;
         int num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
         std::sort(num_token_buckets.begin(), num_token_buckets.end());
@@ -290,9 +331,9 @@ public:
 
         for (auto const& gemm_idx : gemm_idxes)
         {
-            runProfileGemmIdx(hidden_size, inter_size, num_experts, static_cast<int>(top_k), static_cast<int>(tp_size),
-                static_cast<int>(tp_rank), static_cast<int>(ep_size), static_cast<int>(ep_rank), num_token_buckets,
-                gemm_idx, stream);
+            runProfileGemmIdx(hidden_size, inter_size, num_experts, static_cast<int>(top_k),
+                static_cast<int>(group_size), static_cast<int>(tp_size), static_cast<int>(tp_rank),
+                static_cast<int>(ep_size), static_cast<int>(ep_rank), num_token_buckets, gemm_idx, stream);
         }
 
         common::check_cuda_error(cudaStreamDestroy(stream));
@@ -516,14 +557,15 @@ private:
 
     bool mUseFp8BlockScaling = false;
     bool mMinLatencyMode = false;
+    bool mUseW4AFp8 = false;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     std::vector<Profile> mAllProfiles;
 
     void runProfileGemmIdx(int64_t const hidden_size, int64_t const inter_size, int const num_experts,
-        int const experts_per_token, int const tp_size, int const tp_rank, int const ep_size, int const ep_rank,
-        std::vector<int64_t> const& num_token_buckets, profiler_backend::GemmToProfile const gemm_idx,
-        cudaStream_t stream)
+        int const experts_per_token, int const group_size, int const tp_size, int const tp_rank, int const ep_size,
+        int const ep_rank, std::vector<int64_t> const& num_token_buckets,
+        profiler_backend::GemmToProfile const gemm_idx, cudaStream_t stream)
     {
         auto gemm_id_moe = GemmIDMoe{gemm_idx, hidden_size, inter_size, num_experts, experts_per_token};
 
@@ -537,11 +579,12 @@ private:
         mProfiler->mGemmToProfile = gemm_idx;
         // TODO: support more dtypes and expert parallelism
         auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
+        auto act_dtype = mUseW4AFp8 ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
         mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
-            tensorrt_llm::runtime::TorchUtils::dataType(mActivationDtype),
+            tensorrt_llm::runtime::TorchUtils::dataType(act_dtype),
             tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
             tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, experts_per_token, hidden_size,
-            inter_size, /* group_size */ -1, tensorrt_llm::ActivationType::Swiglu,
+            inter_size, group_size, tensorrt_llm::ActivationType::Swiglu,
             /* bias */ false, /* use_lora */ false, mMinLatencyMode, parallelism_config);
 
         char* profile_workspace = nullptr;
@@ -657,7 +700,7 @@ private:
         size_t moe_workspace_size
             = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts, experts_per_token,
                 activation_type, parallelismConfig, /* use_lora */ false, mUseFp8BlockScaling, mMinLatencyMode,
-                /* hasExpertPrequantScales */ false);
+                /* hasExpertPrequantScales */ true);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
 
         std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
@@ -758,6 +801,28 @@ private:
             return kernels::QuantParams::FP8BlockScaling(
                 static_cast<float const*>(fc1_scales.data_ptr()), static_cast<float const*>(fc2_scales.data_ptr()));
         }
+        else if (isInt4Quant())
+        {
+            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for INT4 quantization");
+            TORCH_CHECK(quant_scales.value().size() == 8, "Expecting 8 quant scales for INT4 quantization");
+            auto& fc1_weight_scales = quant_scales.value()[0];
+            auto& fc2_weight_scales = quant_scales.value()[1];
+            auto& fc1_act_scales = quant_scales.value()[2];
+            auto& fc2_act_scales = quant_scales.value()[3];
+            auto& fc1_weight_zeros = quant_scales.value()[4];
+            auto& fc2_weight_zeros = quant_scales.value()[5];
+            auto& fc1_alpha = quant_scales.value()[6];
+            auto& fc2_alpha = quant_scales.value()[7];
+            int group_size = hidden_size / fc1_weight_scales.sizes()[1];
+            return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
+                static_cast<void const*>(fc2_weight_scales.data_ptr()),
+                static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales.data_ptr() : nullptr),
+                static_cast<void const*>(fc2_act_scales.numel() > 0 ? fc2_act_scales.data_ptr() : nullptr),
+                static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros.data_ptr() : nullptr),
+                static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros.data_ptr() : nullptr),
+                static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha.data_ptr() : nullptr),
+                static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr));
+        }
         else
         {
             return kernels::QuantParams{};
@@ -774,6 +839,11 @@ private:
     {
         return mWeightDtype == c10::ScalarType::Long;
     }
+
+    bool isInt4Quant() const
+    {
+        return mWeightDtype == c10::ScalarType::QUInt4x2;
+    }
 };
 
 torch::Tensor fused_moe(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
@@ -781,10 +851,10 @@ torch::Tensor fused_moe(torch::Tensor const& input, torch::Tensor const& token_s
     torch::Tensor const& fc2_expert_weights, c10::ScalarType const& output_dtype,
     torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, torch::optional<torch::Tensor> input_sf,
     int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-    torch::optional<c10::ArrayRef<int64_t>> profile_ids, bool use_fp8_block_scaling)
+    torch::optional<c10::ArrayRef<int64_t>> profile_ids, bool use_fp8_block_scaling, bool use_w4afp8)
 {
     return FusedMoeRunner::getInstance(
-        input.scalar_type(), fc1_expert_weights.scalar_type(), output_dtype, use_fp8_block_scaling, false)
+        input.scalar_type(), fc1_expert_weights.scalar_type(), output_dtype, use_fp8_block_scaling, false, use_w4afp8)
         ->runMoe(input, token_selected_experts, token_final_scales, fc1_expert_weights, fc2_expert_weights,
             quant_scales, input_sf, tp_size, tp_rank, ep_size, ep_rank, profile_ids);
 }
@@ -794,10 +864,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_moe
     torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights,
     c10::ScalarType const& output_dtype, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
     torch::optional<torch::Tensor> input_sf, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size,
-    int64_t const ep_rank, torch::optional<c10::ArrayRef<int64_t>> profile_ids, bool use_fp8_block_scaling)
+    int64_t const ep_rank, torch::optional<c10::ArrayRef<int64_t>> profile_ids, bool use_fp8_block_scaling,
+    bool use_w4afp8)
 {
     return FusedMoeRunner::getInstance(
-        input.scalar_type(), fc1_expert_weights.scalar_type(), output_dtype, use_fp8_block_scaling, true)
+        input.scalar_type(), fc1_expert_weights.scalar_type(), output_dtype, use_fp8_block_scaling, true, use_w4afp8)
         ->runMoeMinLantency(input, token_selected_experts, token_final_scales, fc1_expert_weights, fc2_expert_weights,
             quant_scales, input_sf, tp_size, tp_rank, ep_size, ep_rank, profile_ids);
 }
@@ -821,7 +892,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor[]? quant_scales=None, "
         "Tensor? input_sf=None, "
         "int tp_size=1, int tp_rank=0, int ep_size=1, int ep_rank=0, int[]? profile_ids=None, "
-        "bool use_fp8_block_scaling=False) -> Tensor");
+        "bool use_fp8_block_scaling=False, bool use_w4afp8=False) -> Tensor");
     m.def(
         "fused_moe_min_latency(Tensor input, Tensor token_selected_experts, "
         "Tensor? token_final_scales, Tensor fc1_expert_weights, Tensor fc2_expert_weights, "
@@ -829,7 +900,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor[]? quant_scales=None, "
         "Tensor? input_sf=None, "
         "int tp_size=1, int tp_rank=0, int ep_size=1, int ep_rank=0, int[]? profile_ids=None, "
-        "bool use_fp8_block_scaling=False) -> (Tensor, Tensor, Tensor, Tensor)");
+        "bool use_fp8_block_scaling=False, bool use_w4afp8=False) -> (Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

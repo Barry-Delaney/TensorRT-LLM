@@ -525,13 +525,15 @@ private:
     static TmaWarpSpecializedGroupedGemmInput computeStridesTmaWarpSpecialized(int64_t const* expert_first_token_offset,
         TmaWarpSpecializedGroupedGemmInput layout_info, int64_t num_tokens, int64_t expanded_num_tokens, int64_t gemm_n,
         int64_t gemm_k, int const num_experts_per_node, T const* in, WeightType const* weights,
+        TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const* w4a8_weight_scale_flat,
         float const* fp8_dequant, TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_scale_flat,
         QuantParams::FP4Inputs::GemmInputs fp4_inputs, T const* bias, UnfusedGemmOutputType* output,
         cudaStream_t stream);
     static TmaWarpSpecializedGroupedGemmInput computeStridesTmaWarpSpecializedLowLatency(
         TmaWarpSpecializedGroupedGemmInput layout_info, int64_t num_tokens, int64_t gemm_n, int64_t gemm_k,
-        int const num_experts_per_node, T const* in, WeightType const* weights, float const* fp8_dequant,
-        TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_scale_flat,
+        int const num_experts_per_node, T const* in, WeightType const* weights,
+        TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const* w4a8_weight_scale_flat,
+        float const* fp8_dequant, TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_scale_flat,
         QuantParams::FP4Inputs::GemmInputs fp4_inputs, T const* bias, UnfusedGemmOutputType* output,
         int const* num_active_experts_per, int const* active_expert_global_ids, int start_expert,
         bool use_same_input_for_all_experts, cudaStream_t stream);

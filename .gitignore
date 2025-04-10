@@ -62,3 +62,6 @@ CMakeUserPresets.json
 compile_commands.json
 *.bin
 .dir-locals.el
+
+# DS-R1 activation checkpoint file
+!convert/input_scales.safetensors
