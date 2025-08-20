@@ -575,6 +575,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                                     requires_grad=False)
         else:
             module.register_parameter("bias", None)
+        
+        if get_sm_version() == 100:
+            module.has_been_profiled = False
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
@@ -592,6 +595,18 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                     module.weight_scale)
             else:
                 from tensorrt_llm import deep_gemm
+                if not module.has_been_profiled and input.numel() > 0:
+                    for i in range(128, 4096, 128):
+                        warm_up_input = torch.ones((i, input.shape[1]), dtype=input.dtype, device=input.device)
+                        warm_up_a, warm_up_a_sf = fp8_utils.per_token_quant_and_transform(warm_up_input)
+                        warm_up_output = torch.empty((i, module.weight.shape[0]),
+                                            device=input.device,
+                                            dtype=torch.bfloat16)
+                        deep_gemm.fp8_gemm_nt((warm_up_a, warm_up_a_sf),
+                                            (module.weight, module.weight_scale),
+                                            warm_up_output,
+                                            disable_ue8m0_cast=True)
+                    module.has_been_profiled = True
                 a, a_sf = fp8_utils.per_token_quant_and_transform(input)
                 output = torch.empty((input.shape[0], module.weight.shape[0]),
                                      device=input.device,
