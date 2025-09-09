@@ -711,27 +711,18 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             act_input_sf = set_strides(workspace["workspace_sf"],
                                        self.expert_size_per_partition,
                                        scale_k_padded // 4, m_padded)
-
-            act_input_sf = masked_index_copy_group_quant_fp8(
-                act_input_fp8,
-                act_input_sf,
-                permuted_data_tensor,
-                expert_first_token_offset_tensor,
-                token_to_expert_map,
-                group_size=128)
         else:
             act_input_sf = set_strides(workspace["workspace_sf"],
                                        self.expert_size_per_partition, m_padded,
                                        scale_k).view(torch.float32)
-            for i in range(self.expert_size_per_partition):
-                start = expert_first_token_offset_tensor[i].item()
-                end = expert_first_token_offset_tensor[i + 1].item()
-                if start >= end:
-                    continue
-                input = permuted_data_tensor[start:end, :]
-                act, act_sf = per_token_cast_to_fp8(input.unsqueeze(0))
-                act_input_fp8[i, :end - start].copy_(act.squeeze(0))
-                act_input_sf[i, :end - start].copy_(act_sf.squeeze(0))
+        act_input_sf = masked_index_copy_group_quant_fp8(
+            act_input_fp8,
+            act_input_sf,
+            permuted_data_tensor,
+            expert_first_token_offset_tensor,
+            token_to_expert_map,
+            group_size=128,
+            scale_ue8m0=use_sm100)
 
         # grouped gemm 1
         h1 = set_strides(workspace["workspace_1"],
