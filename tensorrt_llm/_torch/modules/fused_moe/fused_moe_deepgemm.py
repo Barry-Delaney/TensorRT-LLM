@@ -519,7 +519,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         scale_k_padded = fp8_utils.align(scale_k, 4)
 
         workspace_sf = get_empty(
-            (num_experts * ((scale_k_padded // 4) if get_sm_version() == 100 else scale_k) * m_padded, ),
+            (num_experts *
+             ((scale_k_padded // 4) if get_sm_version() == 100 else scale_k) *
+             m_padded, ),
             dtype=torch.int32,
             cache_name='workspace_sf')
 
@@ -640,12 +642,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         m_padded = fp8_utils.align(m_max, 4)
         scale_k = fp8_utils.ceil_div(self.hidden_size, 128)
 
-
         if use_sm100:
             scale_k_padded = fp8_utils.align(scale_k, 4)
             act_input_sf = set_strides(workspace["workspace_sf"],
-                                    self.expert_size_per_partition,
-                                    scale_k_padded // 4, m_padded)
+                                       self.expert_size_per_partition,
+                                       scale_k_padded // 4, m_padded)
 
             act_input_sf = masked_index_copy_group_quant_fp8(
                 act_input_fp8,
@@ -656,18 +657,17 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 group_size=128)
         else:
             act_input_sf = set_strides(workspace["workspace_sf"],
-                                    self.expert_size_per_partition,
-                                    m_padded, scale_k).view(torch.float32)
+                                       self.expert_size_per_partition, m_padded,
+                                       scale_k).view(torch.float32)
             for i in range(self.expert_size_per_partition):
                 start = expert_first_token_offset_tensor[i].item()
-                end = expert_first_token_offset_tensor[i +
-                                                      1].item()
+                end = expert_first_token_offset_tensor[i + 1].item()
                 if start >= end:
                     continue
                 input = permuted_data_tensor[start:end, :]
                 act, act_sf = per_token_cast_to_fp8(input.unsqueeze(0))
-                act_input_fp8[i, :end-start].copy_(act.squeeze(0))
-                act_input_sf[i, :end-start].copy_(act_sf.squeeze(0))
+                act_input_fp8[i, :end - start].copy_(act.squeeze(0))
+                act_input_sf[i, :end - start].copy_(act_sf.squeeze(0))
 
         # grouped gemm 1
         h1 = set_strides(workspace["workspace_1"],
@@ -695,26 +695,25 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         if use_sm100:
             scale_k_padded = fp8_utils.align(scale_k, 4)
             act_input_sf = set_strides(workspace["workspace_sf"],
-                                    self.expert_size_per_partition,
-                                    scale_k_padded // 4, m_padded)
+                                       self.expert_size_per_partition,
+                                       scale_k_padded // 4, m_padded)
 
-            act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
+            act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd_ue8m0(
                 output=act_input_fp8,
                 output_scale=act_input_sf,
                 input=h1,
                 quant_group_size=128,
-                masked_m=masked_m,
-                scale_ue8m0=True)
+                masked_m=masked_m)
         else:
             act_input_sf = set_strides(workspace["workspace_sf"],
-                                    self.expert_size_per_partition,
-                                    m_padded, scale_k).view(torch.float32)
-            up, gate = h1.chunk(2, dim=2)
-            h2 = torch.nn.functional.silu(gate) * up
-            act, act_sf = per_token_cast_to_fp8(h2)
-            act_input_fp8.copy_(act)
-            act_input_sf.copy_(act_sf)
-
+                                       self.expert_size_per_partition, m_padded,
+                                       scale_k).view(torch.float32)
+            fp8_utils.silu_and_mul_masked_post_quant_fwd(
+                output=act_input_fp8,
+                output_scale=act_input_sf,
+                input=h1,
+                quant_group_size=128,
+                masked_m=masked_m)
 
         # grouped gemm 2
         h3 = set_strides(workspace["workspace_1"],
