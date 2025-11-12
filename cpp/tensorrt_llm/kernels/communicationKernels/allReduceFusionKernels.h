@@ -61,7 +61,8 @@ enum class AllReduceFusionPattern : int
     // The difference between these two and the standard version is that the NormOut version outputs the result of the
     // norm.
     kARResidualRMSNormOutFP8Quant = 4,
-    kARResidualRMSNormOutFP4Quant = 5
+    kARResidualRMSNormOutFP4Quant = 5,
+    kARResidual = 6
 };
 
 enum class QuantType : int
@@ -88,6 +89,7 @@ struct FusionPatternTraits;
     };
 
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kAllReduce, true, false, false, false, false, QuantType::kNone);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidual, false, true, true, false, false, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNorm, false, true, true, true, true, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(

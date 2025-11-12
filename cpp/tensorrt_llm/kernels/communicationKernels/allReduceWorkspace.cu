@@ -18,18 +18,18 @@
 namespace tensorrt_llm::kernels::ar_fusion
 {
 
-__global__ void lamport_initialize_kernel(float* ptr, int size)
+__global__ void lamport_initialize_kernel(float* ptr, int size, bool zero)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size)
         return;
-    ptr[idx] = -0.f;
+    ptr[idx] = zero ? 0.f : -0.f;
 }
 
-void lamport_initialize(void* ptr, int bytes, cudaStream_t stream)
+void lamport_initialize(void* ptr, int bytes, cudaStream_t stream, bool zero)
 {
     int grid_size = (bytes + 127) / 128;
-    lamport_initialize_kernel<<<grid_size, 128, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float));
+    lamport_initialize_kernel<<<grid_size, 128, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float), zero);
 }
 
 Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
@@ -46,7 +46,8 @@ Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
     int flag_size = tp_size * kBarrierFlagCount * sizeof(int);
     int lamport_comm_size = tp_size * std::max(kOneShotMaxToken, max_token_num) * hidden_dim * sizeof(half);
     int lamport_buffer_size = 3 * lamport_comm_size;
-    for (auto size : {buffer_size, flag_size, lamport_buffer_size})
+    int flag_buffer_size = tp_size * 36 * 3 * sizeof(int);
+    for (auto size : {buffer_size, flag_size, lamport_buffer_size, flag_buffer_size})
     {
         m_ipc_mem_handles.emplace_back(size, *m_buffer_mgr, m_world_config, p2p_supported);
     }
@@ -75,7 +76,8 @@ Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
     TLLM_CUDA_CHECK(cudaMalloc(&m_workspace, workspace.size() * sizeof(void*)));
     TLLM_CUDA_CHECK(
         cudaMemcpy(m_workspace, workspace.data(), workspace.size() * sizeof(void*), cudaMemcpyHostToDevice));
-    lamport_initialize(m_ipc_mem_handles[2].getCommPtrs()[rank], lamport_buffer_size, 0);
+    lamport_initialize(m_ipc_mem_handles[2].getCommPtrs()[rank], lamport_buffer_size, 0, false);
+    lamport_initialize(m_ipc_mem_handles[3].getCommPtrs()[rank], flag_buffer_size, 0, true);
 }
 
 Workspace::~Workspace()

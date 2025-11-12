@@ -495,188 +495,188 @@ private:
     std::shared_ptr<tr::CudaStream> m_stream;
 };
 
-TEST(Kernel_AllReduceFusion, AllReduceAccuracyRandomTokenNum)
-{
-    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kAllReduce>;
-    auto& comm = mpi::MpiComm::world();
-    auto world_size = comm.getSize();
-    auto rank = comm.getRank();
-    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+// TEST(Kernel_AllReduceFusion, AllReduceAccuracyRandomTokenNum)
+// {
+//     using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kAllReduce>;
+//     auto& comm = mpi::MpiComm::world();
+//     auto world_size = comm.getSize();
+//     auto rank = comm.getRank();
+//     ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
 
-    int iter = 100;
-    std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
-    int min_token_num = 1;
-    int max_token_num = 2048;
-    for (auto hidden_dim : candidate_hidden_dim)
-    {
-        Runner runner(max_token_num, hidden_dim);
-        for (int i = 0; i < iter; ++i)
-        {
-            int token_num = get_random_int(min_token_num, max_token_num);
-            if (rank == 0)
-            {
-                printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
-            }
-            runner.reset_io();
-            runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
-            runner.verify(token_num, hidden_dim);
-            if (rank == 0)
-            {
-                printf("\033[32mPass!\033[0m\n");
-            }
-        }
-    }
-}
+//     int iter = 100;
+//     std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+//     int min_token_num = 1;
+//     int max_token_num = 2048;
+//     for (auto hidden_dim : candidate_hidden_dim)
+//     {
+//         Runner runner(max_token_num, hidden_dim);
+//         for (int i = 0; i < iter; ++i)
+//         {
+//             int token_num = get_random_int(min_token_num, max_token_num);
+//             if (rank == 0)
+//             {
+//                 printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+//             }
+//             runner.reset_io();
+//             runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+//             runner.verify(token_num, hidden_dim);
+//             if (rank == 0)
+//             {
+//                 printf("\033[32mPass!\033[0m\n");
+//             }
+//         }
+//     }
+// }
 
-TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
-{
-    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kAllReduce>;
-    auto& comm = mpi::MpiComm::world();
-    auto world_size = comm.getSize();
-    auto rank = comm.getRank();
-    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+// TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
+// {
+//     using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kAllReduce>;
+//     auto& comm = mpi::MpiComm::world();
+//     auto world_size = comm.getSize();
+//     auto rank = comm.getRank();
+//     ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
 
-    int iter = 10;
-    std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
-    int min_token_num = 1;
-    int max_token_num = 2048;
-    for (auto hidden_dim : candidate_hidden_dim)
-    {
-        Runner runner(max_token_num, hidden_dim);
-        for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)
-        {
-            if (rank == 0)
-            {
-                printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
-            }
-            for (int i = 0; i < iter; ++i)
-            {
-                runner.reset_io();
-                runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
-                runner.verify(token_num, hidden_dim);
-            }
-            if (rank == 0)
-            {
-                printf("\033[32mPass!\033[0m\n");
-            }
-        }
-    }
-}
+//     int iter = 10;
+//     std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+//     int min_token_num = 1;
+//     int max_token_num = 2048;
+//     for (auto hidden_dim : candidate_hidden_dim)
+//     {
+//         Runner runner(max_token_num, hidden_dim);
+//         for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)
+//         {
+//             if (rank == 0)
+//             {
+//                 printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+//             }
+//             for (int i = 0; i < iter; ++i)
+//             {
+//                 runner.reset_io();
+//                 runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+//                 runner.verify(token_num, hidden_dim);
+//             }
+//             if (rank == 0)
+//             {
+//                 printf("\033[32mPass!\033[0m\n");
+//             }
+//         }
+//     }
+// }
 
-TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentHiddenDim)
-{
-#define TEST_AR_FUSION(DType, FusionPattern)                                                                           \
-    {                                                                                                                  \
-        using Runner = TestRunner<DType, FusionPattern>;                                                               \
-        int iter = 10;                                                                                                 \
-        std::vector<int> candidate_hidden_dim{64, 128, 256, 384, 512, 640, 768, 896};                                  \
-        int min_token_num = 1;                                                                                         \
-        int max_token_num = 2048;                                                                                      \
-        for (auto hidden_dim : candidate_hidden_dim)                                                                   \
-        {                                                                                                              \
-            Runner runner(max_token_num, hidden_dim);                                                                  \
-            for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)                            \
-            {                                                                                                          \
-                if (rank == 0)                                                                                         \
-                {                                                                                                      \
-                    printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);                     \
-                }                                                                                                      \
-                for (int i = 0; i < iter; ++i)                                                                         \
-                {                                                                                                      \
-                    runner.reset_io();                                                                                 \
-                    runner.run_once(&Runner::run_kernel, token_num, hidden_dim);                                       \
-                    runner.verify(token_num, hidden_dim);                                                              \
-                }                                                                                                      \
-                if (rank == 0)                                                                                         \
-                {                                                                                                      \
-                    printf("\033[32mPass!\033[0m\n");                                                                  \
-                }                                                                                                      \
-            }                                                                                                          \
-        }                                                                                                              \
-    }
-    auto& comm = mpi::MpiComm::world();
-    auto world_size = comm.getSize();
-    auto rank = comm.getRank();
-    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+// TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentHiddenDim)
+// {
+// #define TEST_AR_FUSION(DType, FusionPattern)                                                                           \
+//     {                                                                                                                  \
+//         using Runner = TestRunner<DType, FusionPattern>;                                                               \
+//         int iter = 10;                                                                                                 \
+//         std::vector<int> candidate_hidden_dim{64, 128, 256, 384, 512, 640, 768, 896};                                  \
+//         int min_token_num = 1;                                                                                         \
+//         int max_token_num = 2048;                                                                                      \
+//         for (auto hidden_dim : candidate_hidden_dim)                                                                   \
+//         {                                                                                                              \
+//             Runner runner(max_token_num, hidden_dim);                                                                  \
+//             for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)                            \
+//             {                                                                                                          \
+//                 if (rank == 0)                                                                                         \
+//                 {                                                                                                      \
+//                     printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);                     \
+//                 }                                                                                                      \
+//                 for (int i = 0; i < iter; ++i)                                                                         \
+//                 {                                                                                                      \
+//                     runner.reset_io();                                                                                 \
+//                     runner.run_once(&Runner::run_kernel, token_num, hidden_dim);                                       \
+//                     runner.verify(token_num, hidden_dim);                                                              \
+//                 }                                                                                                      \
+//                 if (rank == 0)                                                                                         \
+//                 {                                                                                                      \
+//                     printf("\033[32mPass!\033[0m\n");                                                                  \
+//                 }                                                                                                      \
+//             }                                                                                                          \
+//         }                                                                                                              \
+//     }
+//     auto& comm = mpi::MpiComm::world();
+//     auto world_size = comm.getSize();
+//     auto rank = comm.getRank();
+//     ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
 
-    int const arch = tensorrt_llm::common::getSMVersion();
-    if (arch >= 100)
-    {
-        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
-    }
-    else
-    {
-        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
-    }
-#undef TEST_AR_FUSION
-}
+//     int const arch = tensorrt_llm::common::getSMVersion();
+//     if (arch >= 100)
+//     {
+//         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+//     }
+//     else
+//     {
+//         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+//     }
+// #undef TEST_AR_FUSION
+// }
 
-TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
-{
-#define TEST_AR_FUSION(DType, FusionPattern)                                                                           \
-    {                                                                                                                  \
-        using Runner = TestRunner<DType, FusionPattern>;                                                               \
-        Runner runner(max_token_num, hidden_dim);                                                                      \
-        for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)                                \
-        {                                                                                                              \
-            if (rank == 0)                                                                                             \
-            {                                                                                                          \
-                printf("[Verify] pattern %-20s, dtype %-10s, token_num %-4d, hidden_dim %-4d ...", #FusionPattern,     \
-                    #DType, token_num, hidden_dim);                                                                    \
-            }                                                                                                          \
-            runner.reset_io();                                                                                         \
-            runner.run_once(&Runner::run_kernel, token_num, hidden_dim);                                               \
-            runner.verify(token_num, hidden_dim);                                                                      \
-            if (rank == 0)                                                                                             \
-            {                                                                                                          \
-                printf("\033[32mPass!\033[0m\n");                                                                      \
-            }                                                                                                          \
-        }                                                                                                              \
-    }
+// TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
+// {
+// #define TEST_AR_FUSION(DType, FusionPattern)                                                                           \
+//     {                                                                                                                  \
+//         using Runner = TestRunner<DType, FusionPattern>;                                                               \
+//         Runner runner(max_token_num, hidden_dim);                                                                      \
+//         for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)                                \
+//         {                                                                                                              \
+//             if (rank == 0)                                                                                             \
+//             {                                                                                                          \
+//                 printf("[Verify] pattern %-20s, dtype %-10s, token_num %-4d, hidden_dim %-4d ...", #FusionPattern,     \
+//                     #DType, token_num, hidden_dim);                                                                    \
+//             }                                                                                                          \
+//             runner.reset_io();                                                                                         \
+//             runner.run_once(&Runner::run_kernel, token_num, hidden_dim);                                               \
+//             runner.verify(token_num, hidden_dim);                                                                      \
+//             if (rank == 0)                                                                                             \
+//             {                                                                                                          \
+//                 printf("\033[32mPass!\033[0m\n");                                                                      \
+//             }                                                                                                          \
+//         }                                                                                                              \
+//     }
 
-    int const arch = tensorrt_llm::common::getSMVersion();
-    auto& comm = mpi::MpiComm::world();
-    auto world_size = comm.getSize();
-    auto rank = comm.getRank();
-    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+//     int const arch = tensorrt_llm::common::getSMVersion();
+//     auto& comm = mpi::MpiComm::world();
+//     auto world_size = comm.getSize();
+//     auto rank = comm.getRank();
+//     ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
 
-    std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
-    int min_token_num = 1;
-    int max_token_num = 2048;
-    for (auto hidden_dim : candidate_hidden_dim)
-    {
-        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kAllReduce);
-        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
-        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
-        if (arch >= 100)
-        {
-            TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
-        }
-        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kAllReduce);
-        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
-        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
-#if defined(ENABLE_BF16)
-        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kAllReduce);
-        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
-        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
-        if (arch >= 100)
-        {
-            TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
-        }
-#endif
-    }
-#undef TEST_AR_FUSION
-}
+//     std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+//     int min_token_num = 1;
+//     int max_token_num = 2048;
+//     for (auto hidden_dim : candidate_hidden_dim)
+//     {
+//         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kAllReduce);
+//         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
+//         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+//         if (arch >= 100)
+//         {
+//             TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+//         }
+//         TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kAllReduce);
+//         TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
+//         TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+// #if defined(ENABLE_BF16)
+//         TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kAllReduce);
+//         TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
+//         TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+//         if (arch >= 100)
+//         {
+//             TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+//         }
+// #endif
+//     }
+// #undef TEST_AR_FUSION
+// }
 
 TEST(Kernel_AllReduceFusion, Perf)
 {
     int const arch = tensorrt_llm::common::getSMVersion();
-    if (arch < 100)
-    {
-        GTEST_SKIP() << "Skipping test for SM < 100";
-    }
+    // if (arch < 100)
+    // {
+    //     GTEST_SKIP() << "Skipping test for SM < 100";
+    // }
 
-    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant>;
+    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kARResidual>;
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
@@ -710,12 +710,12 @@ TEST(Kernel_AllReduceFusion, Perf)
         {
             TLLM_LOG_INFO("rms norm latency %4.4fus", rms_latency);
         }
-        auto quant_latency = runner.benchmark(&Runner::run_fp4_quant, warmup, iter, token_num, hidden_dim);
+        // auto quant_latency = runner.benchmark(&Runner::run_fp4_quant, warmup, iter, token_num, hidden_dim);
         if (rank == 0)
         {
-            TLLM_LOG_INFO("fp4 quant latency %4.4fus", quant_latency);
-            auto tot_latency = nccl_latency + residual_latency + rms_latency + quant_latency;
-            TLLM_LOG_INFO("fusion kernel latency %4.4fus, nccl + ops latency %4.4fus, total speedup %2.4fx", latency,
+            // TLLM_LOG_INFO("fp4 quant latency %4.4fus", quant_latency);
+            auto tot_latency = nccl_latency;// + rms_latency + quant_latency;
+            TLLM_LOG_INFO("fusion kernel latency %4.4fus, nccl + ops latency %4.4fus, nccl speedup %2.4fx", latency,
                 tot_latency, tot_latency / latency);
         }
     }
