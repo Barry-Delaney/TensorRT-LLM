@@ -9,7 +9,7 @@ import torch
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
-from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._utils import mem_probe_checkpoint, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
                                           ModelExpressConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
@@ -327,12 +327,15 @@ class ModelLoader:
         Returns:
             The loaded and initialized PyTorch model.
         """
+        mem_probe_checkpoint("model_loader:load_start")
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
         load_format = self.llm_args.load_format
+        mem_probe_checkpoint("model_loader:after_validate_config")
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
+            mem_probe_checkpoint("model_loader:after_maybe_create_balancer")
             try:
                 # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
@@ -346,6 +349,7 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
+            mem_probe_checkpoint("model_loader:after_model_from_config")
 
             memo = dict()
 
@@ -410,13 +414,16 @@ class ModelLoader:
 
             # Ensure everything is at least on CUDA
             # No-op if worked as expected
+            mem_probe_checkpoint("model_loader:before_model_to_cuda")
             model.to("cuda")
             del memo
+            mem_probe_checkpoint("model_loader:after_model_to_cuda")
 
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
+            mem_probe_checkpoint("model_loader:before_checkpoint_load_weights")
             weights_preloaded = False
             if load_format == LoadFormat.AUTO:
                 # Pass model= so format-specific loaders (e.g. MX) can
@@ -480,26 +487,32 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
+            mem_probe_checkpoint("model_loader:after_checkpoint_load_weights")
             checkpoint_loader.post_load_apply(
                 model, weights_preloaded=weights_preloaded)
             checkpoint_loader.post_load_publish(
                 model,
                 checkpoint_dir=checkpoint_dir,
                 weights_preloaded=weights_preloaded)
+            mem_probe_checkpoint("model_loader:after_post_load_apply_publish")
 
             for module in model.modules():
                 if hasattr(module, 'post_load_weights') and not getattr(
                         module, '_weights_removed', False):
                     module.post_load_weights()
+            mem_probe_checkpoint("model_loader:after_module_post_load_weights_loop")
 
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 moe_load_balancer.register_weight_slots_after_to_cuda()
                 logger.info("moe_load_balancer finalizing model...")
                 moe_load_balancer.finalize_model()
                 logger.info("moe_load_balancer finalize model done")
+            mem_probe_checkpoint("model_loader:after_moe_load_balancer_finalize")
 
             torch.cuda.current_stream().synchronize()
+            mem_probe_checkpoint("model_loader:after_stream_sync")
 
+        mem_probe_checkpoint("model_loader:load_end")
         return model, moe_load_balancer
 
     def reload(self,
