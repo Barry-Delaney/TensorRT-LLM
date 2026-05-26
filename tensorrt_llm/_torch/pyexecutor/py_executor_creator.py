@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, mem_probe_checkpoint
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -487,6 +487,7 @@ def create_py_executor(
                     vm_pools[stage] = memory_pool
                     yield
 
+    mem_probe_checkpoint("py_executor_creator:before_MODEL_ENGINE_MAIN")
     with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN):
         model_weights_memory_tag = None
         model_weights_restore_mode = None
@@ -495,6 +496,8 @@ def create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
+        mem_probe_checkpoint(
+            "py_executor_creator:before_PyTorchModelEngine_ctor")
         model_engine = PyTorchModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
@@ -506,7 +509,10 @@ def create_py_executor(
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
+        mem_probe_checkpoint(
+            "py_executor_creator:after_PyTorchModelEngine_ctor")
 
+    mem_probe_checkpoint("py_executor_creator:after_MODEL_ENGINE_MAIN")
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
     calibrator = get_calibrator()

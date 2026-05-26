@@ -70,6 +70,20 @@ np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
 
 
+def mem_probe_checkpoint(name: str) -> None:
+    # Debug-only hook used to attribute device memory growth to specific
+    # initialization phases. No-op unless TLLM_MEM_PROBE_CHECKPOINT=1 and an
+    # external mem_probe module is importable (auto-injected via Python
+    # usercustomize in our probe harness).
+    if os.environ.get("TLLM_MEM_PROBE_CHECKPOINT") != "1":
+        return
+    try:
+        import mem_probe
+        mem_probe.checkpoint(name)
+    except Exception:
+        pass
+
+
 def get_hf_rope_theta(config: Any, default: float = 10000.0) -> float:
     """Return RoPE ``theta`` from a Hugging Face ``PreTrainedConfig``-like object.
 

@@ -14,7 +14,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
+from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory,
+                                 mem_probe_checkpoint, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -215,6 +216,7 @@ class PyTorchModelEngine(ModelEngine):
                 mx_model_name=llm_args.model,
             )
 
+        mem_probe_checkpoint("model_engine:__init__start")
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
@@ -274,14 +276,19 @@ class PyTorchModelEngine(ModelEngine):
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
+            mem_probe_checkpoint("model_engine:before_model_loader_load")
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
+            mem_probe_checkpoint("model_engine:after_model_loader_load")
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
         if drafting_loop_wrapper is not None:
+            mem_probe_checkpoint(
+                "model_engine:before_drafting_loop_wrapper")
             self.model = drafting_loop_wrapper(self.model)
+            mem_probe_checkpoint("model_engine:after_drafting_loop_wrapper")
             self.model_is_wrapped = True
         else:
             self.model_is_wrapped = False
@@ -301,7 +308,9 @@ class PyTorchModelEngine(ModelEngine):
         self._disable_overlap_scheduler = self.llm_args.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
+        mem_probe_checkpoint("model_engine:before_init_model_capacity")
         self._init_model_capacity()
+        mem_probe_checkpoint("model_engine:after_init_model_capacity")
 
         self.cuda_graph_config = self.llm_args.cuda_graph_config
         cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
@@ -350,9 +359,11 @@ class PyTorchModelEngine(ModelEngine):
             )
 
         try:
+            mem_probe_checkpoint("model_engine:before_init_userbuffers_gate")
             use_ub_for_nccl = (
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
+            mem_probe_checkpoint("model_engine:after_init_userbuffers_gate")
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
@@ -563,6 +574,7 @@ class PyTorchModelEngine(ModelEngine):
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
 
         self._prepare_inputs_event: Optional[torch.cuda.Event] = None
+        mem_probe_checkpoint("model_engine:__init__end")
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
