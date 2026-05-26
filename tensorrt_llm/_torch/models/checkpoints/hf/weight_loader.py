@@ -129,11 +129,20 @@ class HfWeightLoader(BaseWeightLoader):
         weights = {}
         pbar = tqdm.tqdm(total=len(weight_files), desc=description)
 
+        # Optional override: TLLM_WEIGHT_LOAD_WORKERS caps thread pool size.
+        # Used to test whether thread-pool growth correlates with a +30 GiB
+        # device-memory spike observed only on aarch64 Grace+Blackwell
+        # (NVLink-C2C ATS-mapped pages would scale with concurrent CUDA-
+        # touching threads). Defaults to None (use ThreadPoolExecutor default).
+        num_workers = os.environ.get("TLLM_WEIGHT_LOAD_WORKERS")
+        num_workers = int(num_workers) if num_workers else None
+
         # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
         # specifically the comma right after the w is important to make it a tuple.
         run_concurrently(load_func, [(w, ) for w in weight_files],
                          reduce_func=weights.update,
-                         pbar=pbar)
+                         pbar=pbar,
+                         num_workers=num_workers)
 
         return ConsumableWeightsDict(weights)
 
