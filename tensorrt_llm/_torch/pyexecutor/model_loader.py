@@ -435,12 +435,14 @@ class ModelLoader:
                     "model": model,
                 }
 
+                mem_probe_checkpoint("model_loader:before_main_disk_read")
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
                         model.llm_checkpoint_dir, **load_weights_kwargs)
                 else:
                     weights = checkpoint_loader.load_weights(
                         checkpoint_dir, **load_weights_kwargs)
+                mem_probe_checkpoint("model_loader:after_main_disk_read")
 
                 # When MX P2P succeeds, weights are already in model params.
                 # A non-empty dict contains size-mismatched tensors that
@@ -448,16 +450,22 @@ class ModelLoader:
                 weights_preloaded = checkpoint_loader.is_weights_preloaded()
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
+                mem_probe_checkpoint("model_loader:after_get_weight_mapper")
 
                 if weights:
                     self._call_load_weights(model.load_weights, weights,
                                             self.weight_mapper)
+                mem_probe_checkpoint("model_loader:after_main_call_load_weights")
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
+                    mem_probe_checkpoint(
+                        "model_loader:before_draft_disk_read")
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
+                    mem_probe_checkpoint(
+                        "model_loader:after_draft_disk_read")
 
                     draft_model_arch = model.draft_config.pretrained_config.architectures[
                         0]
@@ -468,6 +476,8 @@ class ModelLoader:
 
                     self._call_load_weights(model.load_draft_weights, weights,
                                             draft_weight_mapper)
+                    mem_probe_checkpoint(
+                        "model_loader:after_draft_call_load_weights")
 
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
