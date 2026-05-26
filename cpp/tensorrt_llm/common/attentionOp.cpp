@@ -900,6 +900,35 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     workspaces[26] = fmha_multi_ctas_kv_scratch_size;
     context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
+    // [WSDBG] — workspace breakdown probe to diff B300 vs GB300 root cause.
+    TLLM_LOG_INFO("[WSDBG-CTX] mNumAttnHeads=%d getHeadSize=%d mNumAttnKVHeads=%d "
+                  "mFP8ContextFMHA=%d mFP8ContextMLA=%d isSeparateQAndKvInput=%d useSparseMLA=%d "
+                  "useTllmGenSparseAttention=%d useTllmGenSparseAttentionPaged=%d "
+                  "max_num_seq=%d input_seq_length=%d cross_kv_length=%d max_num_tokens=%d total_kv_len=%d "
+                  "total_q_dim_all_heads=%d total_k_dim_all_heads=%d total_v_dim_all_heads=%d "
+                  "local_hidden_units_qo=%d local_hidden_units_kv=%d "
+                  "mMultiProcessorCount=%d mCpSize=%d "
+                  "ws[0]CUBLAS=%zu ws[6]q_buf_2=%zu ws[12]fp8_qkv=%zu "
+                  "ws[13]fp8_q=%zu ws[14]fp8_k=%zu ws[15]fp8_v=%zu "
+                  "ws[18]tokens_info=%zu ws[26]multi_ctas_kv=%zu "
+                  "TOTAL_context_ws=%zu",
+                  mNumAttnHeads, getHeadSize(), mNumAttnKVHeads,
+                  static_cast<int>(mFP8ContextFMHA), static_cast<int>(mFP8ContextMLA),
+                  static_cast<int>(mFmhaDispatcher->isSeparateQAndKvInput()),
+                  static_cast<int>(useSparseMLA()),
+                  static_cast<int>(useTllmGenSparseAttention()),
+                  static_cast<int>(useTllmGenSparseAttentionPaged()),
+                  static_cast<int>(max_num_seq), static_cast<int>(input_seq_length),
+                  static_cast<int>(cross_kv_length), static_cast<int>(max_num_tokens),
+                  static_cast<int>(total_kv_len),
+                  total_q_dim_all_heads, total_k_dim_all_heads, total_v_dim_all_heads,
+                  local_hidden_units_qo, local_hidden_units_kv,
+                  mMultiProcessorCount, mCpSize,
+                  workspaces[0], q_buf_2_size, fp8_qkv_buffer_size,
+                  fp8_q_buf_size, fp8_k_buf_size, fp8_v_buf_size,
+                  tokens_info_size, fmha_multi_ctas_kv_scratch_size,
+                  context_workspace_size);
+
     return context_workspace_size;
 }
 
@@ -1017,7 +1046,32 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
 
-    return std::max(std::max(generation_workspace_size, xqa_workspace_size), fmha_v2_mla_workspace_size);
+    size_t const final_gen_ws
+        = std::max(std::max(generation_workspace_size, xqa_workspace_size), fmha_v2_mla_workspace_size);
+
+    // [WSDBG] — generation workspace breakdown probe.
+    TLLM_LOG_INFO("[WSDBG-GEN] mNumHeads=%d mHeadSize=%d mNumKVHeads=%d "
+                  "mIsMLAEnabled=%d mUseGenFlashMLA=%d mIsGenerationMLA=%d mEnableXQA=%d "
+                  "mUseSparseAttention=%d useSparseMLA=%d "
+                  "max_num_seq=%d max_attn_window=%d max_num_tokens=%d max_blocks_per_seq=%d "
+                  "mMultiProcessorCount=%d mMaxSharedMemoryPerBlockOptin=%d mCpSize=%d mMultiBlockMode=%d "
+                  "minSeqLenTile=%d maxSeqLenTile=%d "
+                  "partial_out=%zu partial_sum=%zu partial_max=%zu shift_k=%zu cp_ws=%zu "
+                  "gen_ws=%zu xqa_ws=%zu fmha_v2_mla_ws=%zu TOTAL_gen=%zu",
+                  mNumHeads, getHeadSize(), mNumKVHeads,
+                  static_cast<int>(mIsMLAEnabled), static_cast<int>(mUseGenFlashMLA),
+                  static_cast<int>(mIsGenerationMLA), static_cast<int>(mEnableXQA),
+                  static_cast<int>(mUseSparseAttention), static_cast<int>(useSparseMLA()),
+                  static_cast<int>(max_num_seq), static_cast<int>(max_attention_window_size),
+                  static_cast<int>(max_num_tokens), static_cast<int>(max_blocks_per_sequence),
+                  mMultiProcessorCount, mMaxSharedMemoryPerBlockOptin, mCpSize,
+                  static_cast<int>(mMultiBlockMode),
+                  minSeqLenTile, maxSeqLenTile,
+                  partial_out_size, partial_sum_size, partial_max_size, shift_k_cache_size, cpWorkspaceSize,
+                  generation_workspace_size, xqa_workspace_size, fmha_v2_mla_workspace_size,
+                  final_gen_ws);
+
+    return final_gen_ws;
 }
 
 int AttentionOp::getMaxNumSeqLenTile(int batch_beam_size) const
