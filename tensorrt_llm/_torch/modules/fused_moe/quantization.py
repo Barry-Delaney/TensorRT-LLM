@@ -5010,6 +5010,13 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
             _redundant.data = torch.empty(0,
                                           dtype=_redundant.dtype,
                                           device=_redundant.device)
+        # Return the freed segments to the OS so the ~5-6 GiB of cached but
+        # unallocated reserved memory accumulated across per-layer DG
+        # transform + redundant-release is reclaimable before downstream
+        # stages (KV cache estimation, attention workspace alloc). Without
+        # this, PyTorch's caching allocator holds the freed segments, eating
+        # headroom on marginal-fit configs (V4-Pro DEP4 + MTP1 + mnt=16k).
+        torch.cuda.empty_cache()
         mem_probe_checkpoint(f"mega_moe:transform:layer{_li}:after_redundant_release")
 
     def _setup_shared_weights_for_eplb(self, module: torch.nn.Module) -> None:
