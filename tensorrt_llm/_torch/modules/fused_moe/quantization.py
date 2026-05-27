@@ -23,7 +23,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version, is_device_integrated, is_sm_100f
+from tensorrt_llm._utils import (get_sm_version, is_device_integrated,
+                                 is_sm_100f, mem_probe_checkpoint)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -4915,7 +4916,18 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
         self._setup_shared_weights_for_eplb(module)
         self._attach_initial_weight_assignments(module)
 
-    def _transform_main_weights(self, module: torch.nn.Module) -> None:
+    def _transform_main_weights(self, module: torch.nn.Module) -> None:  # noqa: D401
+        # mem_probe instrumentation: track per-layer torch_alloc before/after
+        # DG transform call and after redundant-param release. Validates that
+        # the documented ~24 GiB/rank dead-duplicate release in this function
+        # is actually freeing memory on DSv4-Pro (where the 222 → 210 GiB net
+        # delta vs TRTLLM backend suggests an under-release).
+        _li = getattr(module, 'layer_idx', '?')
+        mem_probe_checkpoint(f"mega_moe:transform:layer{_li}:enter")
+        self._transform_main_weights_inner(module)
+        mem_probe_checkpoint(f"mega_moe:transform:layer{_li}:exit")
+
+    def _transform_main_weights_inner(self, module: torch.nn.Module) -> None:
         """Build DG-form ``_t_l1`` / ``_t_l2`` and EPLB-friendly slot views.
 
         Invariant: the scale tensors returned by ``_transform_weights_for_mega_moe``
@@ -4950,6 +4962,8 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
         if module._t_l1 is not None:
             return
         device = module.w3_w1_weight.device
+        _li = getattr(module, 'layer_idx', '?')
+        mem_probe_checkpoint(f"mega_moe:transform:layer{_li}:before_dg_transform")
         module._t_l1, module._t_l2 = self._transform_weights_for_mega_moe(
             module,
             module.w3_w1_weight,
@@ -4958,6 +4972,7 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
             module.w2_weight_scale,
             device=device,
         )
+        mem_probe_checkpoint(f"mega_moe:transform:layer{_li}:after_dg_transform")
         module._t_l1_weight, module._t_l1_scale = module._t_l1
         module._t_l2_weight, module._t_l2_scale = module._t_l2
         module._t_l1_scale_slot = module._t_l1_scale.transpose(-2, -1)
@@ -4988,11 +5003,14 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
             )
         assert module._t_l2[1].data_ptr() != module.w2_weight_scale.data_ptr(
         ), ("MegaMoE dedup invariant broken: _t_l2[1] aliases w2_weight_scale.")
+        _li = getattr(module, 'layer_idx', '?')
+        mem_probe_checkpoint(f"mega_moe:transform:layer{_li}:before_redundant_release")
         for _redundant in (module.w3_w1_weight, module.w3_w1_weight_scale,
                            module.w2_weight_scale):
             _redundant.data = torch.empty(0,
                                           dtype=_redundant.dtype,
                                           device=_redundant.device)
+        mem_probe_checkpoint(f"mega_moe:transform:layer{_li}:after_redundant_release")
 
     def _setup_shared_weights_for_eplb(self, module: torch.nn.Module) -> None:
         """Transform & register host-side shared weights for dynamic EPLB.
