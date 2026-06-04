@@ -131,7 +131,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
-        layer_num = len(self._kv_cache_manager.pp_layers)
+        layer_num = len(self._kv_cache_manager.pp_layers) - getattr(
+            self._kv_cache_manager, 'num_spec_layers', 0)
         if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
             assert isinstance(self._kv_cache_manager._impl, PythonMambaCacheManager), (
                 "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"

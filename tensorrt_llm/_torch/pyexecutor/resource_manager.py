@@ -177,7 +177,7 @@ def get_pp_layers(
     mapping: Mapping,
     spec_config: Optional["DecodingBaseConfig"] = None,
     layer_mask: Optional[List[bool]] = None,
-) -> Tuple[List[int], int]:
+) -> Tuple[List[int], int, int]:
     from ..speculative.utils import get_num_spec_layers
 
     total_num_layers = num_layers
@@ -202,16 +202,18 @@ def get_pp_layers(
     # Only add speculative layers when layer_mask is not provided.
     # When layer_mask is provided, the caller explicitly controls which layers
     # to include, so we should not add extra layers automatically.
+    num_spec_layers_added = 0
     if spec_config is not None and layer_mask is None:
-        num_spec_layers = get_num_spec_layers(spec_config)
-        total_num_layers += num_spec_layers
+        num_spec_layers_added = get_num_spec_layers(spec_config)
+        total_num_layers += num_spec_layers_added
         if mapping.is_last_pp_rank():
             pp_layers.extend(
-                range(total_num_layers - num_spec_layers, total_num_layers))
+                range(total_num_layers - num_spec_layers_added,
+                      total_num_layers))
     if len(pp_layers) == 0:
         # Don't support empty KV cache for now, provide at least 1 layer
         pp_layers.append(0)
-    return pp_layers, total_num_layers
+    return pp_layers, total_num_layers, num_spec_layers_added
 
 
 def request_context(is_draft: bool, scheduled_requests: ScheduledRequests):
@@ -389,7 +391,7 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
-        self.pp_layers, self.num_layers = get_pp_layers(
+        self.pp_layers, self.num_layers, self.num_spec_layers = get_pp_layers(
             num_layers,
             mapping,
             spec_config=spec_config,
@@ -1916,7 +1918,7 @@ class KVCacheManagerV2(BaseResourceManager):
             "Star attention is not supported for KVCacheManagerV2"
 
         self.kv_cache_type = kv_cache_type
-        self.pp_layers, self.num_layers = get_pp_layers(
+        self.pp_layers, self.num_layers, self.num_spec_layers = get_pp_layers(
             num_layers,
             mapping,
             spec_config=spec_config,
