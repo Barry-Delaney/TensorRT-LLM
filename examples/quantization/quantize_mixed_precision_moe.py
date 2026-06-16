@@ -1,5 +1,6 @@
 # autoflake: skip_file
 import argparse
+import glob
 import json
 import os
 import re
@@ -43,25 +44,31 @@ def parse_args():
 
 def load_and_preprocess_state_dict(modelopt_state_root, world_size=8):
     state_dict_list = []
-    # load amax from state dict
-    for rank in range(world_size):
-        amax_file = f"{modelopt_state_root}/amax_dict_rank{rank}-mp{world_size}.pt"
-        if os.path.exists(amax_file):
-            state_dict_list.append(torch.load(amax_file, map_location="cuda:0"))
-        else:
-            print(f"WARNING: amax file not found: {amax_file}")
+    # Load every amax rank dump present, regardless of the mp{N} suffix. The
+    # previous code looked up a hardcoded mp{world_size} (default 8), so a
+    # calibration run with any other world size silently produced no scales.
+    amax_files = sorted(
+        glob.glob(os.path.join(modelopt_state_root, "amax_dict_rank*-mp*.pt")))
+    for amax_file in amax_files:
+        state_dict_list.append(torch.load(amax_file, map_location="cuda:0"))
 
     if not state_dict_list:
-        print("ERROR: No amax files loaded!")
+        print("ERROR: No amax_dict_rank*-mp*.pt files found in "
+              f"{modelopt_state_root}")
         return {}
 
-    # calculate the max across all TP ranks
-    merged_state_dict = state_dict_list[0]
-    for rank in range(world_size):
-        for key, amax in state_dict_list[rank].items():
-            if key in merged_state_dict.items():
-                amax = torch.max(amax.to(0), merged_state_dict[key].to(0))
-            merged_state_dict[key] = amax.to(0)
+    # calculate the max across all loaded TP ranks. Iterate over the loaded
+    # state dicts directly (not range(world_size)) so a missing rank file does
+    # not cause an IndexError, and use `key in merged_state_dict` for the
+    # membership test (`key in dict.items()` compares against (k, v) tuples and
+    # is always False, which silently disabled the cross-rank max).
+    merged_state_dict = {}
+    for state_dict in state_dict_list:
+        for key, amax in state_dict.items():
+            amax = amax.to(0)
+            if key in merged_state_dict:
+                amax = torch.max(amax, merged_state_dict[key])
+            merged_state_dict[key] = amax
 
     mapping = {
         "ffn.shared_experts.w1": "mlp.shared_experts.gate_proj",
@@ -102,7 +109,14 @@ def load_and_preprocess_state_dict(modelopt_state_root, world_size=8):
                 merged_state_dict[key] = fused_amax
                 merged_state_dict[gate_proj_key] = fused_amax
             elif "input_quantizer" in key:
-                assert amax == merged_state_dict[gate_proj_key]
+                # gate_proj and up_proj are fused and consume the same input, so
+                # they must share a single input scale. Force both to the max
+                # rather than asserting bit-exact equality: calibration can leave
+                # tiny per-module differences, and `assert tensor == tensor`
+                # would raise on a non-scalar amax.
+                fused_amax = torch.max(amax, merged_state_dict[gate_proj_key])
+                merged_state_dict[key] = fused_amax
+                merged_state_dict[gate_proj_key] = fused_amax
             else:
                 raise NotImplementedError
 
@@ -178,9 +192,17 @@ def main(args):
         config = json.load(file)
 
     num_layer = config['num_hidden_layers']
-    part_layer = (num_layer + args.parts - 1) // args.parts
+    # Include the MTP / multi-token-prediction layers
+    # (model.layers.{num_layer .. num_layer+num_nextn-1}) in the processing
+    # range so their weights are written (otherwise rank 0 registers them in the
+    # index but no rank writes them -> dangling). The MTP MoE is kept as the
+    # source FP8 block scale rather than requantized to W4A8: ModelOpt does not
+    # calibrate the MTP layer, so there are no W4A8 activation scales for it.
+    num_nextn = config.get('num_nextn_predict_layers', 0)
+    num_total_layer = num_layer + num_nextn
+    part_layer = (num_total_layer + args.parts - 1) // args.parts
     start_layer = args.rank * part_layer
-    end_layer = min(num_layer, args.rank * part_layer + part_layer)
+    end_layer = min(num_total_layer, args.rank * part_layer + part_layer)
 
     def get_tensor(name):
         if name not in weight_map:
@@ -198,8 +220,15 @@ def main(args):
     new_json['weight_map'] = {}
     new_json['metadata'] = {}
     for key in tqdm(list(weight_map.keys())):
-        if "mlp.experts" in key and (key.endswith("weight")
-                                     or key.endswith("weight_scale_inv")):
+        key_parts = key.split(".")
+        key_layer = int(key_parts[2]) if (len(key_parts) > 2
+                                          and key_parts[2].isdigit()) else None
+        # MTP-layer experts (layer index >= num_layer) are NOT requantized to
+        # int4; they fall through to the copy path below and are kept as the
+        # source FP8 block scale (no W4A8 activation scales exist for them).
+        is_mtp_layer = key_layer is not None and key_layer >= num_layer
+        if (not is_mtp_layer) and "mlp.experts" in key and (
+                key.endswith("weight") or key.endswith("weight_scale_inv")):
             if key.endswith("weight_scale_inv"):
                 continue
             if args.rank == 0:
@@ -207,6 +236,17 @@ def main(args):
                 new_json['weight_map'][key] = get_file_name(layer)
                 new_json['weight_map'][key.replace(
                     "weight", "weight_scale_inv")] = get_file_name(layer)
+                # In the amax-dir (ModelOpt) path the per-expert activation
+                # input_scale is generated by get_scales_from_amax and written
+                # into the shard, but was never registered in the index, so the
+                # W4A8 input scales were invisible to index-based loaders.
+                # Register them here, mirroring the weight registration above.
+                if os.path.isdir(args.act_scales):
+                    proj = key.split(".")[-2]  # gate_proj / up_proj / down_proj
+                    widx = {"gate_proj": 1, "down_proj": 2, "up_proj": 3}[proj]
+                    new_json['weight_map'][key.replace(
+                        f"{proj}.weight",
+                        f"w{widx}.input_scale")] = get_file_name(layer)
             if int(key.split(".")[2]) < start_layer or int(
                     key.split(".")[2]) >= end_layer:
                 continue
@@ -267,14 +307,18 @@ def main(args):
             "modeling_deepseek.py", "tokenizer.json", "tokenizer_config.json"
         ]
         for name in names:
-            shutil.copy(os.path.join(model_dir, name), output_dir)
+            src = os.path.join(model_dir, name)
+            if os.path.exists(src):
+                shutil.copy(src, output_dir)
+            else:
+                print(f"WARNING: aux file not found, skipping: {src}")
         if os.path.isdir(args.act_scales):
             shutil.copytree(args.act_scales, output_dir, dirs_exist_ok=True)
         else:
             shutil.copy(args.act_scales, output_dir)
 
         # config.json
-        del config['quantization_config']
+        config.pop('quantization_config', None)
         with open(os.path.join(output_dir, "config.json"), 'w') as file:
             json.dump(config, file, indent=4)
 
@@ -287,18 +331,25 @@ def main(args):
         quant_cfg["quant_algo"] = "MIXED_PRECISION"
         quant_cfg["kv_cache_quant_algo"] = None
         quant_cfg["quantized_layers"] = {}
-        for l in range(61):
+        first_k_dense = config.get('first_k_dense_replace', 3)
+        for l in range(num_total_layer):
             prefix = f"model.layers.{l}"
+            is_mtp_layer = l >= num_layer
             for n1 in attn_names:
                 quant_cfg["quantized_layers"][
                     f"{prefix}.self_attn.{n1}"] = fp8_block_scale
             for n2 in mlp_names:
                 quant_cfg["quantized_layers"][
                     f"{prefix}.mlp.shared_experts.{n2}"] = fp8_block_scale
-            if l < 3:
+            if l < first_k_dense:
                 for n3 in mlp_names:
                     quant_cfg["quantized_layers"][
                         f"{prefix}.mlp.{n3}"] = fp8_block_scale
+            elif is_mtp_layer:
+                # MTP MoE is kept as FP8 block scale (not W4A8), since ModelOpt
+                # does not calibrate the MTP layer's activations.
+                quant_cfg["quantized_layers"][
+                    f"{prefix}.mlp.experts"] = fp8_block_scale
             else:
                 quant_cfg["quantized_layers"][
                     f"{prefix}.mlp.experts"] = w4a8_awq
