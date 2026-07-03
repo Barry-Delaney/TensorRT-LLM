@@ -3312,6 +3312,32 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         if self.need_load_shared_weights(module):
             self._register_mega_shared_staging(module)
 
+        # ---- Release the now-dead source NVFP4 routed weights ----
+        # ``run_moe`` reads ONLY ``mega_fc1/fc2_weight(_sf)``; the source
+        # ``w3_w1_weight`` / ``w2_weight`` (+ their block-scale tensors) are
+        # fully consumed by ``_build_mega_format_weights`` above (into fresh,
+        # independent storage) and are never read at runtime, yet they persist
+        # as registered Parameters -- roughly doubling the per-rank expert
+        # footprint (~229 vs ~131 GiB on DSv4-Pro DEP8), which OOMs / starves the
+        # KV cache. Free their storage so the MegaMoE-CuteDSL footprint matches
+        # the other NVFP4 backends. EXCEPTION: dynamic EPLB online rebalance
+        # re-reads the source to rebuild mega buffers, so keep them when active.
+        # Free via ``replace_parameter_and_save_metadata`` so ``pre_reload_weights``
+        # can restore the original shape on a later reload (dynamic EPLB / weight
+        # update); the registered Parameters stay 0-element in the meantime.
+        if not self.need_load_shared_weights(module):
+            for _name in ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight",
+                          "w2_weight_scale"):
+                _p = getattr(module, _name, None)
+                if _p is not None and _p.data.numel() > 0:
+                    replace_parameter_and_save_metadata(
+                        module, _name,
+                        nn.Parameter(torch.empty(0,
+                                                 dtype=_p.data.dtype,
+                                                 device=_p.data.device),
+                                     requires_grad=False),
+                        module.rebuild_tensor_metadata)
+
     @staticmethod
     def _build_fc1_norm_const_tensor(raw_input_scales: Dict,
                                      expert_ids: List[int],

@@ -510,7 +510,26 @@ class MegaMoECuteDsl(MoE):
         # NOTE: the cross-rank combine path (token_back_mode) and fc2 store path
         # (use_bulk_fc2_store) are now autotuner TACTIC fields, not backend
         # constants -- the op/runner pick them per token bucket.
+        import os as _os
+
+        # form-B (in-kernel REDG combine) opt-in via the ctor arg. Pairs with the
+        # op forcing a NON-BULK tactic when on (else silent corruption) and is
+        # NON-deterministic (bf16 atomic-add); off by default.
         self.in_kernel_fc2_reduce = bool(in_kernel_fc2_reduce)
+
+        # Cross-rank combine WIRE FORMAT (env-gated): bf16 (default) /
+        # 32e4m3xe8m0 (fp8/MXFP8) / 16e2m1xbf16 (fp4). Quantized formats need
+        # the separate-reduce path (kernel rejects in_kernel_fc2_reduce +
+        # quantized), so auto-disable in-kernel reduce when quantized; default
+        # bf16 keeps every existing deployment on the validated path.
+        self.combine_format = _os.environ.get("MEGAMOE_COMBINE_FORMAT", "bf16")
+        if self.combine_format != "bf16" and self.in_kernel_fc2_reduce:
+            logger.warning(
+                "[MegaMoECuteDsl] combine_format=%s is quantized; disabling "
+                "in_kernel_fc2_reduce (separate-reduce required).",
+                self.combine_format,
+            )
+            self.in_kernel_fc2_reduce = False
 
         # SwiGLU clamp: map the model-provided per-layer ``swiglu_limit`` tensor
         # to the kernel's codegen-time scalar ``gate_up_clamp``. The MegaMoE
@@ -527,6 +546,35 @@ class MegaMoECuteDsl(MoE):
             or getattr(model_config, "max_num_tokens", 0)
             or 4096
         )
+
+        # Adaptive ``max_tokens_per_rank`` bucketing. The kernel is a
+        # compile-time-fixed ``max_tokens_per_rank`` GEMM: launched at the
+        # full ``max_num_tokens`` it does prefill-sized work even when decode
+        # feeds ~1 token/rank (the dominant decode-TPOT cost). Instead we
+        # pre-build one symmetric provider + kernel per bucket of a power-of-2
+        # ladder and, per launch, pick the smallest bucket that fits the
+        # lockstep cross-rank chunk token count (see ``_select_launch_max_tokens``
+        # / ``set_adaptive_launch_tokens``). All EP ranks derive the SAME ladder
+        # (pure function of ``max_num_tokens`` + env, identical across ranks) and
+        # the SAME per-chunk bucket (from ``max(all_rank_num_tokens)``, an
+        # allgathered value), so the in-kernel NVLink barrier stays valid.
+        # ``self.max_num_tokens`` is the GLOBAL MoE budget (= per-rank
+        # ``max_num_tokens`` x attention dp_size; see model_config.py). Per-rank
+        # chunks never exceed the per-rank cap, so derive the ladder from that --
+        # else the top (global) bucket is allocated but never selected, wasting a
+        # symmetric provider. dp_size <= 1 -> no-op.
+        _dp = max(1, int(getattr(self.mapping, "dp_size", 1)))
+        self._maxt_buckets = self._resolve_maxt_buckets(self.max_num_tokens // _dp)
+        # Per-bucket symmetric providers (int bucket -> MegaMoeSymmMemProvider),
+        # filled at ``create_weights`` time for the multi-rank EP path.
+        # ``_symm_provider`` keeps pointing at the full (max) bucket for the
+        # existing None / num_topk guards.
+        self._symm_providers = {}
+        # Lockstep per-chunk cross-rank max token count for the NEXT run_moe,
+        # set by ``FusedCommMoEScheduler`` via ``set_adaptive_launch_tokens``.
+        # ``None`` -> use the full bucket (the safe default for any caller that
+        # does not set it, e.g. single-rank tests / microbench).
+        self._active_launch_max_tokens: Optional[int] = None
 
         # Resolve EP ProcessGroup at construction. Resolving at forward
         # time would be collective on a non-synchronous call stack and
@@ -564,9 +612,12 @@ class MegaMoECuteDsl(MoE):
         # Per-instance staging cache (key -> {tensor name: tensor}) and
         # last-staged-T tracker; together they implement the always-pad-
         # to-max_T launch contract by refreshing only the rows that
-        # changed between calls.
+        # changed between calls. ``_last_staged_T`` is keyed by the buffer's
+        # ``max_T`` (= bucket): each adaptive bucket owns a distinct staging
+        # buffer with its own row-reset history, so a shared scalar would reset
+        # the wrong buffer when launches alternate buckets (prefill <-> decode).
         self._local_staging_cache: Dict[Tuple, Dict[str, torch.Tensor]] = {}
-        self._last_staged_T: Optional[int] = None
+        self._last_staged_T: Dict[int, int] = {}
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -603,6 +654,90 @@ class MegaMoECuteDsl(MoE):
                 f"swiglu_limit with values {flat.cpu().tolist()}."
             )
         return float(first.item())
+
+    @staticmethod
+    def _resolve_maxt_buckets(max_num_tokens: int) -> List[int]:
+        """Resolve the adaptive ``max_tokens_per_rank`` bucket ladder.
+
+        The ladder MUST be a pure function of ``max_num_tokens`` and the
+        environment so every EP rank derives the identical list (and thus the
+        identical per-chunk bucket downstream -- a divergent ladder would break
+        the cross-rank NVLink barrier).
+
+        Controls (all default to the adaptive ladder):
+          * ``MEGAMOE_ADAPTIVE_MAXT=0`` -> single bucket (legacy always-pad-to-
+            max behaviour); the escape hatch for A/B comparison and safety.
+          * ``MEGAMOE_AUTOTUNE=1`` -> single bucket. The autotuner's profiling
+            scratch is sized for one ``max_T``; co-supporting per-bucket scratch
+            is deferred, so autotune forces the legacy path.
+          * ``MEGAMOE_MAXT_BUCKETS="256,1024,4096"`` -> explicit buckets
+            (each clamped to ``max_num_tokens``; the full bucket is always
+            included).
+          * default -> ``{256, 1024, 4096}`` rungs below the per-rank
+            ``max_num_tokens`` ceiling, plus that ceiling as the top bucket. The
+            caller passes the PER-RANK cap (``moe_max_num_tokens // dp_size``),
+            not the global budget, so the top bucket is reachable (never a dead
+            global bucket). The 256/1024 rungs win decode; the ceiling covers
+            prefill chunks. Small ladder by design: extra rungs multiply the
+            compile/fence/capture/memory surface.
+        """
+        import os as _os
+
+        full = int(max_num_tokens)
+        if full <= 0:
+            full = 4096
+        if _os.environ.get("MEGAMOE_ADAPTIVE_MAXT", "1") == "0":
+            return [full]
+        if _os.environ.get("MEGAMOE_AUTOTUNE", "0") == "1":
+            return [full]
+        raw = _os.environ.get("MEGAMOE_MAXT_BUCKETS", "").strip()
+        if raw:
+            cand = {min(int(b), full) for b in raw.split(",") if b.strip()}
+        else:
+            cand = {b for b in (256, 1024, 4096) if b < full}
+        cand.add(full)
+        return sorted(b for b in cand if b > 0)
+
+    def _select_launch_max_tokens(self, chunk_max_tokens: Optional[int]) -> int:
+        """Pick the smallest ladder bucket that fits ``chunk_max_tokens``.
+
+        ``chunk_max_tokens`` is the lockstep cross-rank max token count for the
+        chunk (``max(all_rank_num_tokens)``, identical on every EP rank) or
+        ``None`` (no scheduler hint -> full bucket). Because the input is
+        rank-identical and the ladder is rank-identical, the chosen bucket is
+        rank-identical, so all ranks launch the same compiled kernel against the
+        same-sized symmetric buffers and the in-kernel barrier matches.
+        """
+        buckets = self._maxt_buckets
+        if chunk_max_tokens is None or chunk_max_tokens <= 0:
+            return buckets[-1]
+        for b in buckets:
+            if chunk_max_tokens <= b:
+                return b
+        # chunk_max_tokens exceeds the top (per-rank cap) bucket. It is the
+        # rank-identical allgathered ``max(all_rank_num_tokens)``, so RAISE here
+        # fails every EP rank in lockstep. Clamping to ``buckets[-1]`` instead
+        # would let ONLY ranks whose local count exceeds the clamp raise (via the
+        # ``num_tokens > launch_max_T`` guard), desyncing the fused NVLink barrier
+        # -> the surviving ranks hang.
+        raise RuntimeError(
+            f"MegaMoE-CuteDSL: chunk max_tokens_per_rank={chunk_max_tokens} exceeds "
+            f"the top adaptive bucket {buckets[-1]} (per-rank cap = "
+            f"moe_max_num_tokens // attention_dp_size). Raise moe_max_num_tokens or "
+            f"reduce the per-rank chunk."
+        )
+
+    def set_adaptive_launch_tokens(self, chunk_max_tokens: Optional[int]) -> None:
+        """Scheduler hook: record the lockstep per-chunk cross-rank max token
+        count for the next ``run_moe``.
+
+        ``chunk_max_tokens`` MUST be ``max(all_rank_num_tokens)`` for the chunk
+        (an allgathered value, identical on every EP rank) so all ranks select
+        the same bucket. ``None`` falls back to the full bucket. Consumed and
+        reset by the next ``_run_moe`` so an un-hinted call defaults to the
+        full bucket.
+        """
+        self._active_launch_max_tokens = chunk_max_tokens
 
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-
@@ -672,12 +807,60 @@ class MegaMoECuteDsl(MoE):
     # ------------------------------------------------------------------
     # EP process-group resolution (no collective at forward time)
     # ------------------------------------------------------------------
+    def _maybe_init_torch_dist_under_mpi(self):
+        """Bootstrap a torch.distributed NCCL WORLD group under the MPI orchestrator.
+
+        trtllm-bench / mpirun use the MPI orchestrator, which never calls
+        ``torch.distributed.init_process_group`` (only the Ray GPU worker does).
+        MegaMoECuteDsl's symmetric-memory rendezvous needs a torch.distributed
+        ProcessGroup; for the pure-DEP case (``ep_size == world_size``) a single
+        node-local NCCL WORLD group is sufficient and is resolved as
+        ``dist.group.WORLD`` below. This replicates the proven MegaMoE unit-test
+        bootstrap (``tests/.../moe/test_moe_module.py``) and the Ray TorchDist
+        backend string. No-op under Ray (already initialized) or single-rank;
+        opt out with ``MEGAMOE_MPI_INIT_TORCH_DIST=0``.
+        """
+        import os as _os
+
+        if not dist.is_available() or dist.is_initialized():
+            return
+        if _os.environ.get("MEGAMOE_MPI_INIT_TORCH_DIST", "1") != "1":
+            return
+        from tensorrt_llm._utils import mpi_rank, mpi_world_size
+
+        try:
+            world = mpi_world_size()
+            rank = mpi_rank()
+        except Exception as e:  # not under MPI either -> leave uninitialized
+            logger.debug(
+                f"[MegaMoECuteDsl] MPI rank query failed ({e!r}); "
+                "skipping torch.distributed bootstrap."
+            )
+            return
+        if world <= 1:
+            return
+        _os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        _os.environ.setdefault("MASTER_PORT", "29561")
+        _os.environ.setdefault("RANK", str(rank))
+        _os.environ.setdefault("WORLD_SIZE", str(world))
+        _os.environ.setdefault("LOCAL_RANK", str(rank))
+        logger.info(
+            f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
+            f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
+            f"{_os.environ['MASTER_ADDR']}:{_os.environ['MASTER_PORT']}) for the "
+            f"EP rendezvous."
+        )
+        dist.init_process_group(backend="cuda:nccl,cpu:gloo", rank=rank, world_size=world)
+
     def _resolve_ep_pg(self):
         """Return the torch.distributed ProcessGroup for the EP sub-world.
 
         Mirrors :meth:`MegaMoEDeepGemm._resolve_ep_pg` so the two MegaMoE
         backends share the same fallback chain.
         """
+        # Under the MPI orchestrator torch.distributed is not initialized by the
+        # runtime; bootstrap a node-local WORLD group so the EP rendezvous works.
+        self._maybe_init_torch_dist_under_mpi()
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError(
                 "MegaMoECuteDsl requires torch.distributed to be initialized "
@@ -751,10 +934,19 @@ class MegaMoECuteDsl(MoE):
     def _alloc_symm_provider(self):
         """Build-time symmetric provider allocation. See ``create_weights``.
 
-        Returns a :class:`MegaMoeSymmMemProvider` from the module-scope
-        cache. Raises :class:`MegaMoeCuteDslUnavailable` with an
-        actionable message when no ProcessGroup is available -- that
-        would block the rendezvous and is a hard error for multi-rank.
+        Allocates ONE :class:`MegaMoeSymmMemProvider` per adaptive bucket
+        (``self._maxt_buckets``) into ``self._symm_providers`` and returns the
+        full (max) bucket's provider for ``self._symm_provider``. Each bucket's
+        ``get_megamoe_symm_provider`` performs a COLLECTIVE rendezvous, so the
+        loop MUST iterate the same buckets in the same order on every EP rank --
+        guaranteed because ``_maxt_buckets`` is a pure function of
+        ``max_num_tokens`` + env (identical across ranks). The module-scope
+        provider cache means only the first MoE layer pays the rendezvous; later
+        layers hit the cache for every bucket.
+
+        Raises :class:`MegaMoeCuteDslUnavailable` with an actionable message
+        when no ProcessGroup is available -- that would block the rendezvous and
+        is a hard error for multi-rank.
         """
         from ....custom_ops.cute_dsl_megamoe_custom_op import (
             get_megamoe_profiling_scratch,
@@ -768,47 +960,73 @@ class MegaMoECuteDsl(MoE):
                 "ProcessGroup. Use Ray / DeviceMesh (mapping.moe_ep_group_pg) "
                 "or initialize torch.distributed before model build."
             )
+        import os as _os
+
         top_k = self.routing_method.experts_per_token
-        shared_workspace_bytes = query_megamoe_shared_workspace_bytes(
-            world_size=self.ep_size,
-            local_rank=self.ep_rank,
-            num_topk=top_k,
-            num_experts_per_rank=int(self.expert_size_per_partition),
-            hidden_size=self.hidden_size,
-            intermediate_size_per_partition=int(self.intermediate_size_per_partition),
-            expand_intermediate_size_per_partition=int(self.expand_intermediate_size_per_partition),
-            max_tokens_per_rank=int(self.max_num_tokens),
-            in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
-        )
-        staging = get_megamoe_symm_provider(
-            process_group=self._ep_pg,
-            world_size=self.ep_size,
-            rank=self.ep_rank,
-            hidden_size=self.hidden_size,
-            max_tokens_per_rank=int(self.max_num_tokens),
-            num_topk=top_k,
-            output_dtype=self.dtype or torch.bfloat16,
-            shared_workspace_bytes=shared_workspace_bytes,
-            in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
-        )
-        # Separate symmetric scratch for AutoTuner profiling (same layout, own
-        # peer_offsets). Shared across same-shape layers; freed after warmup.
-        scratch = get_megamoe_profiling_scratch(
-            process_group=self._ep_pg,
-            world_size=self.ep_size,
-            rank=self.ep_rank,
-            hidden_size=self.hidden_size,
-            max_tokens_per_rank=int(self.max_num_tokens),
-            num_topk=top_k,
-            output_dtype=self.dtype or torch.bfloat16,
-            shared_workspace_bytes=shared_workspace_bytes,
-            in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
-        )
-        # Hold only a weakref: the global scratch cache owns the buffer, so it
-        # is freed by ``release_megamoe_profiling_scratch()`` after warmup
-        # without this module pinning it for the process lifetime.
-        self._profiling_scratch_provider_ref = weakref.ref(scratch) if scratch is not None else None
-        return staging
+        full_T = self._maxt_buckets[-1]
+        autotune_on = _os.environ.get("MEGAMOE_AUTOTUNE", "0") == "1"
+        self._profiling_scratch_provider_ref = None
+        for max_T in self._maxt_buckets:
+            # Both shared-workspace bytes and the provider's region sizes scale
+            # with ``max_T`` (MAX_SLOT_C = max_T * num_topk), so a small decode
+            # bucket is cheap on every region.
+            shared_workspace_bytes = query_megamoe_shared_workspace_bytes(
+                world_size=self.ep_size,
+                local_rank=self.ep_rank,
+                num_topk=top_k,
+                num_experts_per_rank=int(self.expert_size_per_partition),
+                hidden_size=self.hidden_size,
+                intermediate_size_per_partition=int(self.intermediate_size_per_partition),
+                expand_intermediate_size_per_partition=int(
+                    self.expand_intermediate_size_per_partition
+                ),
+                max_tokens_per_rank=max_T,
+                in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+                combine_format=self.combine_format,
+            )
+            provider = get_megamoe_symm_provider(
+                process_group=self._ep_pg,
+                world_size=self.ep_size,
+                rank=self.ep_rank,
+                hidden_size=self.hidden_size,
+                max_tokens_per_rank=max_T,
+                num_topk=top_k,
+                output_dtype=self.dtype or torch.bfloat16,
+                shared_workspace_bytes=shared_workspace_bytes,
+                in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+            )
+            self._symm_providers[max_T] = provider
+            # Separate symmetric scratch for AutoTuner profiling (same layout,
+            # own peer_offsets). Allocated ONLY for the full bucket and only
+            # when autotuning is enabled (autotune forces a single-bucket
+            # ladder, so the full bucket is the only bucket then). With autotune
+            # bypassed -- the default path -- this scratch is never wired to
+            # the runner, so building it just doubles the build-time symmetric
+            # footprint and can OOM the KV cache on big models.
+            if autotune_on and max_T == full_T:
+                scratch = get_megamoe_profiling_scratch(
+                    process_group=self._ep_pg,
+                    world_size=self.ep_size,
+                    rank=self.ep_rank,
+                    hidden_size=self.hidden_size,
+                    max_tokens_per_rank=max_T,
+                    num_topk=top_k,
+                    output_dtype=self.dtype or torch.bfloat16,
+                    shared_workspace_bytes=shared_workspace_bytes,
+                    in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+                )
+                # Hold only a weakref: the global scratch cache owns the buffer,
+                # so it is freed by ``release_megamoe_profiling_scratch()`` after
+                # warmup without this module pinning it for the process lifetime.
+                self._profiling_scratch_provider_ref = weakref.ref(scratch)
+        if len(self._maxt_buckets) > 1 and self.ep_rank == 0:
+            logger.info(
+                "[MegaMoECuteDsl] adaptive max_tokens_per_rank buckets=%s "
+                "(one symmetric provider + kernel per bucket; per-launch bucket "
+                "= smallest >= max(all_rank_num_tokens))",
+                self._maxt_buckets,
+            )
+        return self._symm_providers[full_T]
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:
         if self.quant_method is None:
@@ -1030,7 +1248,7 @@ class MegaMoECuteDsl(MoE):
             output_dtype=output_dtype,
         )
 
-    def _ensure_local_staging(self, *, top_k: int, hidden: int, device, output_dtype):
+    def _ensure_local_staging(self, *, top_k: int, hidden: int, device, output_dtype, max_T: int):
         """Allocate (and cache) the per-instance local staging tensors.
 
         Always allocates ``topk_idx`` (the kernel reads it as a local-only
@@ -1041,16 +1259,17 @@ class MegaMoECuteDsl(MoE):
         for ``ep_size == 1``; multi-rank pulls them from the symmetric
         provider's regions instead.
 
-        All staging tensors are sized to ``max_num_tokens`` along dim 0
-        so the kernel's constexpr ``num_tokens`` matches the buffer-time
-        ``max_tokens_per_rank``. Diverging the two would make
+        All staging tensors are sized to ``max_T`` (the per-launch adaptive
+        bucket) along dim 0 so the kernel's constexpr ``num_tokens`` matches the
+        buffer-time ``max_tokens_per_rank``. Diverging the two would make
         ``_dispatch_prep`` round 3 (``MAX_SLOT_C = num_tokens * num_topk``
         in dispatch_kernel.py) write per-(expert, rank) advertise cards
         at the wrong stride relative to the symm allocation
         (``max_tokens_per_rank * num_topk`` in megamoe_kernel.py),
-        silently corrupting multi-rank metadata.
+        silently corrupting multi-rank metadata. The cache is keyed by
+        ``max_T`` so each bucket owns a distinct staging set.
         """
-        max_T = int(self.max_num_tokens)
+        max_T = int(max_T)
         cache_key = (max_T, top_k, hidden, str(device), output_dtype)
         cached = self._local_staging_cache
         if cache_key in cached:
@@ -1077,7 +1296,11 @@ class MegaMoECuteDsl(MoE):
             )
             # form-A: (max_T, top_k, hidden); form-B (in_kernel_fc2_reduce):
             # (max_T, 1, hidden) -- kernel folds the top-k reduction in-kernel.
-            combine_k = 1 if self.in_kernel_fc2_reduce else top_k
+            # The kernel returns a unified (T, hidden) output via an INTERNAL
+            # top-k reduce, so combine_output is (max_T, 1, hidden); the op aliases
+            # that storage as the 2D output_activation and the host ``.sum(dim=1)``
+            # over K=1 is free.
+            combine_k = 1
             staging["combine_output"] = torch.empty(
                 (max_T, combine_k, hidden),
                 dtype=torch.bfloat16,
@@ -1101,24 +1324,35 @@ class MegaMoECuteDsl(MoE):
                 ),
                 max_tokens_per_rank=max_T,
                 in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+                combine_format=self.combine_format,
             )
-            staging["shared_workspace"] = torch.empty(
+            # zeros (not empty): the leading counter prefix (expert_recv_count /
+            # _sum) is a sys-atomic-add target the kernel only tail-resets for the
+            # NEXT launch, so the FIRST launch needs it pre-zeroed. Multi-rank gets
+            # this from the symmetric provider's buffer zero; the single-rank path
+            # has no provider, so zero here (one-time, cached per bucket).
+            staging["shared_workspace"] = torch.zeros(
                 shared_bytes, dtype=torch.uint8, device=device
             )
         cached[cache_key] = staging
         return staging
 
-    def _acquire_buffers(self, *, top_k: int, hidden: int, device, output_dtype) -> _MegaMoeBuffers:
-        """Resolve the kernel's input/output buffers.
+    def _acquire_buffers(
+        self, *, top_k: int, hidden: int, device, output_dtype, launch_max_T: int
+    ) -> _MegaMoeBuffers:
+        """Resolve the kernel's input/output buffers for the ``launch_max_T``
+        adaptive bucket.
 
         This is the ONLY structural branch between single-rank and multi-
         rank execution; the source of activation / activation_sf /
         topk_weights / combine_output / shared_workspace differs per the
         :class:`_MegaMoeBuffers` contract. ``topk_idx_local`` always lives
-        in plain CUDA memory.
+        in plain CUDA memory. ``launch_max_T`` selects both the local staging
+        set and (multi-rank) the symmetric provider, which MUST share the same
+        ``max_T`` as the kernel's compile-time ``max_tokens_per_rank``.
         """
         staging = self._ensure_local_staging(
-            top_k=top_k, hidden=hidden, device=device, output_dtype=output_dtype
+            top_k=top_k, hidden=hidden, device=device, output_dtype=output_dtype, max_T=launch_max_T
         )
         if self.ep_size == 1:
             return _MegaMoeBuffers(
@@ -1145,13 +1379,17 @@ class MegaMoECuteDsl(MoE):
                 f"model_config.skip_create_weights_in_init was not set "
                 f"without a follow-up create_weights() call."
             )
-        if self._symm_provider.num_topk != top_k:
+        # Select the provider for this launch's adaptive bucket. ``launch_max_T``
+        # is always a member of ``_maxt_buckets`` (all pre-allocated above), but
+        # fall back to the full bucket defensively.
+        provider = self._symm_providers.get(launch_max_T, self._symm_provider)
+        if provider.num_topk != top_k:
             raise MegaMoeCuteDslUnavailable(
                 f"MegaMoECuteDsl symm provider was built for top_k="
-                f"{self._symm_provider.num_topk} but run_moe called with "
+                f"{provider.num_topk} but run_moe called with "
                 f"top_k={top_k}; recreate the backend."
             )
-        regions = self._symm_provider.get_regions()
+        regions = provider.get_regions()
         return _MegaMoeBuffers(
             activation=regions.activation,
             activation_sf=regions.activation_sf,
@@ -1197,7 +1435,10 @@ class MegaMoECuteDsl(MoE):
             it.
         """
         max_T = bufs.topk_idx_local.shape[0]
-        last_T = getattr(self, "_last_staged_T", None)
+        # ``_last_staged_T`` is keyed by ``max_T`` (= bucket): each bucket's
+        # staging buffer has its own row-reset history, so alternating buckets
+        # (prefill <-> decode) does not reset the wrong buffer's tail.
+        last_T = self._last_staged_T.get(max_T)
         if last_T is not None and last_T > num_tokens:
             bufs.topk_idx_local[num_tokens:last_T].fill_(-1)
         if num_tokens > 0:
@@ -1207,7 +1448,7 @@ class MegaMoECuteDsl(MoE):
             bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
         if num_tokens < max_T:
             bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
-        self._last_staged_T = num_tokens
+        self._last_staged_T[max_T] = num_tokens
 
     def _launch_megamoe_kernel(
         self,
@@ -1226,6 +1467,7 @@ class MegaMoECuteDsl(MoE):
         peer_offsets: List[int],
         num_tokens: int,
         output_dtype: torch.dtype,
+        launch_max_T: int,
     ) -> torch.Tensor:
         """Launch the fused MegaMoE CuteDSL kernel and reduce form-A output.
 
@@ -1288,11 +1530,16 @@ class MegaMoECuteDsl(MoE):
             hidden_size=hidden,
             intermediate_size_per_partition=int(self.intermediate_size_per_partition),
             expand_intermediate_size_per_partition=int(self.expand_intermediate_size_per_partition),
-            max_tokens_per_rank=int(self.max_num_tokens),
+            # Adaptive bucket: launch the kernel compiled for this bucket's
+            # ``max_T`` (== the staging/symm buffer leading dim selected above),
+            # not the full ``max_num_tokens``. Smaller during decode -> the
+            # kernel does bucket-sized work instead of padding to 4096.
+            max_tokens_per_rank=int(launch_max_T),
             peer_offsets=peer_offsets,
             apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
             gate_up_clamp=self.gate_up_clamp,
             in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+            combine_format=self.combine_format,
         )
         set_active_megamoe_profiling_scratch(None)
         if num_tokens == 0:
@@ -1327,29 +1574,44 @@ class MegaMoECuteDsl(MoE):
     ) -> torch.Tensor:
         """Unified MegaMoE CuteDSL forward: acquire -> stage -> launch.
 
-        The kernel is always launched with ``T = max_num_tokens`` (its
-        compile-time constexpr); live tokens fill the first
-        ``num_tokens`` rows and the tail is masked via ``topk_idx == -1``
-        (skipped by dispatch_kernel) and zero ``topk_weights`` (combine
-        stale-data guard).
+        The kernel is launched with ``T = launch_max_T`` -- the smallest
+        adaptive bucket >= the lockstep cross-rank chunk token count (set by
+        ``set_adaptive_launch_tokens``), capped at ``max_num_tokens``. Live
+        tokens fill the first ``num_tokens`` rows and the tail is masked via
+        ``topk_idx == -1`` (skipped by dispatch_kernel) and zero
+        ``topk_weights`` (combine stale-data guard).
 
         ``FusedCommMoEScheduler`` invariant 7 forces every EP rank to
         cross the NVLink barrier even with zero local tokens; only
         single-rank short-circuits ``num_tokens == 0`` because no peer
         is waiting.
         """
-        if num_tokens > self.max_num_tokens:
+        # Pick (and consume) the adaptive bucket for this launch. Resetting to
+        # None means any caller that did not call ``set_adaptive_launch_tokens``
+        # (single-rank tests, microbench) defaults to the full bucket.
+        launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
+        self._active_launch_max_tokens = None
+        if num_tokens > launch_max_T:
+            # Must not happen: num_tokens (this rank's chunk tokens) <=
+            # max(all_rank_num_tokens) <= launch_max_T by construction. If it
+            # does, the lockstep bucket derivation is broken -- fail loudly
+            # rather than read past the bucket buffer / desync the barrier.
             raise RuntimeError(
                 f"MegaMoECuteDsl run_moe got {num_tokens} tokens but the "
-                f"staging buffer is sized for {self.max_num_tokens}. Raise "
-                f"model_config.moe_max_num_tokens so peers do not read "
-                f"invalid rows."
+                f"selected adaptive bucket is sized for {launch_max_T} "
+                f"(buckets={self._maxt_buckets}, max_num_tokens="
+                f"{self.max_num_tokens}). This indicates the scheduler's "
+                f"lockstep chunk-max hint diverged from the staged tokens."
             )
         if num_tokens == 0 and self.ep_size == 1:
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
         bufs = self._acquire_buffers(
-            top_k=top_k, hidden=hidden, device=device, output_dtype=output_dtype
+            top_k=top_k,
+            hidden=hidden,
+            device=device,
+            output_dtype=output_dtype,
+            launch_max_T=launch_max_T,
         )
         self._stage_inputs(
             bufs=bufs,
@@ -1375,4 +1637,5 @@ class MegaMoECuteDsl(MoE):
             peer_offsets=bufs.peer_offsets,
             num_tokens=num_tokens,
             output_dtype=output_dtype,
+            launch_max_T=launch_max_T,
         )

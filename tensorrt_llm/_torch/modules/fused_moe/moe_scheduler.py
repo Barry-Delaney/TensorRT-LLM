@@ -1138,6 +1138,21 @@ class FusedCommMoEScheduler(MoEScheduler):
             # layout-agnostic.
             moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
 
+        # ----- adaptive max_tokens_per_rank bucket (MegaMoE fused kernel) -----
+        # Hand the lockstep per-chunk cross-rank max token count to the backend
+        # so it can launch the smallest kernel/provider bucket that fits this
+        # chunk (decode -> tiny bucket instead of padding to max_num_tokens).
+        # ``max(all_rank_num_tokens)`` is identical on every EP rank
+        # (``all_rank_num_tokens`` is the allgathered, deterministically chunked
+        # per-rank count list -- see ``_compute_chunk_layout``), so every rank
+        # selects the same bucket and the in-kernel NVLink barrier stays valid.
+        # ``None`` (had_meta=False: single-rank / dummy) -> backend full bucket.
+        # ``getattr`` guard: only MegaMoECuteDsl exposes the hook; other
+        # fused-comm backends ignore it.
+        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+        if set_adaptive is not None:
+            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
+
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
