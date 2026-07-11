@@ -62,12 +62,17 @@ class AsyncLLM(LLM):
         """
         await self.collective_rpc("wakeup", args=(tags,))
 
-    async def update_weights(self, weights: dict[str, str]):
+    async def update_weights(self, weights: Optional[dict]):
         """Update the weights of the LLM asynchronously.
 
+        Multi-bucket sweeps are not engine-atomic: bracket them with
+        ``pause_generation()``/``resume_generation()``; broadcast
+        ``abort_update_weights`` before retrying a failed sweep (see
+        ``WorkerExtension.update_weights``).
 
         Args:
-            weights: Dictionary mapping device UUIDs to IPC handles for weight tensors.
+            weights: Dictionary mapping device UUIDs to IPC handles for
+                weight tensors, or ``None`` to finalize a bucketed update.
         """
         await self.collective_rpc("update_weights", args=(weights,))
 

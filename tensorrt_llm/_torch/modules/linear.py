@@ -329,6 +329,82 @@ def get_weight_dtype_and_id(module: Linear) -> tuple[torch.dtype, int]:
             f"Unsupported quant_mode: {module.quant_config.layer_quant_mode}")
 
 
+_RELOAD_OUTSTANDING_ATTR = "_reload_outstanding"
+
+
+def init_reload_coverage(module: torch.nn.Module,
+                         units_by_param: Dict[str, set]) -> None:
+    """Open the per-param reload coverage debt for a module.
+
+    ``units_by_param`` maps each param ``pre_reload_weights`` is about to
+    destroy to the units a covering resend must deliver (Linear: fused
+    shard keys, ``'*'`` for vanilla; MoE: ``(role, expert_id)`` pairs or
+    whole-tensor FUSED_GATE_UP_PROJ keys). "Invalidated" <=> outstanding
+    non-empty. MUST be called BEFORE the destructive re-registration loop
+    so a mid-loop failure still leaves the full debt recorded (can only
+    false-REFUSE, never bless garbage -- do not move it below the loop).
+    """
+    setattr(module, _RELOAD_OUTSTANDING_ATTR, {
+        param: set(units)
+        for param, units in units_by_param.items() if units
+    })
+
+
+def consume_reload_coverage(module: torch.nn.Module,
+                            covered_units_by_param: Dict[str, set]) -> None:
+    """Discard delivered units from the outstanding coverage debt. Units
+    accumulate ACROSS calls (a gate-only then an up-only bucket together
+    cover the fused ``weight``); a per-call intersection would veto legal
+    one-sided fused deliveries.
+    """
+    outstanding = getattr(module, _RELOAD_OUTSTANDING_ATTR, None)
+    if not outstanding:
+        return
+    for param, units in covered_units_by_param.items():
+        remaining = outstanding.get(param)
+        if remaining is None:
+            continue
+        remaining.difference_update(units)
+        if not remaining:
+            del outstanding[param]
+
+
+def clear_reload_coverage(module: torch.nn.Module) -> None:
+    """Drop the module's entire coverage debt. Caller asserts every
+    invalidated param was rewritten (full load, or a model-loader direct
+    write with atomic-group required keys).
+    """
+    setattr(module, _RELOAD_OUTSTANDING_ATTR, {})
+
+
+def raise_on_reload_invalidated_module(module: torch.nn.Module,
+                                       module_kind: str) -> None:
+    """Veto finalization of a module whose params are still uninitialized.
+
+    ``pre_reload_weights`` re-registers params as uninitialized storage
+    after opening the coverage debt; only deliveries that rewrote a
+    param's units consume it. Fires from BOTH finalize hooks because the
+    RLHF finalize walk runs PWAL before post_load_weights.
+    """
+    outstanding = getattr(module, _RELOAD_OUTSTANDING_ATTR, None)
+    if not outstanding:
+        return
+    parts = []
+    for param in sorted(outstanding)[:8]:
+        units = sorted(outstanding[param], key=repr)
+        preview = ", ".join(repr(u) for u in units[:4])
+        if len(units) > 4:
+            preview += f", ... {len(units) - 4} more"
+        parts.append(f"{param}: [{preview}]")
+    if len(outstanding) > 8:
+        parts.append(f"... {len(outstanding) - 8} more params")
+    raise RuntimeError(
+        f"{module_kind} module was invalidated by pre_reload_weights and "
+        "not fully re-delivered: finalizing would serve uninitialized "
+        "memory. The weight sweep must still deliver these param units: "
+        f"{{{'; '.join(parts)}}}.")
+
+
 class LinearMethodBase(ABC):
     """
     Base class for all linear methods.
@@ -338,6 +414,12 @@ class LinearMethodBase(ABC):
     # window buffer. apply() reads this ClassVar to derive output_buffer_kind
     # internally; callers do not pass output_buffer_kind as a parameter.
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
+
+    # Per-cycle transient scale accumulators the load_weights_* hooks stash
+    # on the MODULE and PWAL consumes-and-deletes. After an ABORTED cycle
+    # they survive and would mix stale values into the recovery cycle's
+    # finalize; pre_reload_weights purges them. Subclasses override.
+    _RELOAD_TRANSIENT_ATTRS: ClassVar[tuple] = ()
 
     @abstractmethod
     def create_weights(self, module: Linear, in_features: int,
@@ -459,10 +541,40 @@ class LinearMethodBase(ABC):
         """
         return None
 
+    def reload_coverage_units(self, module: Linear) -> Dict[str, set]:
+        """Full per-unit coverage debt for the params pre_reload destroys:
+        the fused shard keys (``'*'`` for vanilla), one delivery per shard
+        key per param.
+        """
+        shard_keys = module.weights_loading_config.weight_mode.shard_keys \
+            or ('*', )
+        return {
+            param_name: set(shard_keys)
+            for param_name in module.rebuild_tensor_metadata
+        }
+
+    def reload_covered_units(self, module: Linear,
+                             weights: List[Dict]) -> Dict[str, set]:
+        """Units this PARTIAL delivery actually rewrote. Conservative
+        default: report nothing. Full loads never reach this --
+        ``Linear.load_weights`` clears the whole debt instead.
+        """
+        del module, weights
+        return {}
+
     def pre_reload_weights(self, module: Linear) -> None:
         """
         Pre-reload weights for the linear layer.
+
+        The re-registered params hold UNINITIALIZED memory (see
+        ``raise_on_reload_invalidated_module``).
         """
+        # Purge stale transients FIRST (see _RELOAD_TRANSIENT_ATTRS).
+        for _attr in self._RELOAD_TRANSIENT_ATTRS:
+            if hasattr(module, _attr):
+                delattr(module, _attr)
+        # Debt opens BEFORE the destructive loop (see init_reload_coverage).
+        init_reload_coverage(module, self.reload_coverage_units(module))
         for param_name, metadata in module.rebuild_tensor_metadata.items():
             # Extract meta tensor from metadata dict
             meta_tensor = metadata['meta']
@@ -605,10 +717,33 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     copy_weight_shard(module.weight, weight, shard_offset,
                                       shard_size)
 
+    def reload_covered_units(self, module: Linear,
+                             weights: List[Dict]) -> Dict[str, set]:
+        # Subclasses' 'weight' credit (base unquantized Linear has no debt).
+        shard_keys = module.weights_loading_config.weight_mode.shard_keys \
+            or ('*', )
+        covered = {}
+        weight_units = {
+            shard
+            for shard, w in zip(shard_keys, weights) if "weight" in w
+        }
+        if weight_units:
+            covered["weight"] = weight_units
+        return covered
+
 
 class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+
+    # Purged at pre_reload_weights (see LinearMethodBase).
+    _RELOAD_TRANSIENT_ATTRS: ClassVar[tuple] = (
+        "tmp_input_scales",
+        "tmp_weight_scales",
+        "tmp_k_scales",
+        "tmp_v_scales",
+        "has_static_input_scale",
+    )
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -1227,6 +1362,13 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         ]
         processed_mapping = self.remap_fused_shard_indices_by_divisible_factor(
             module.fused_weight_shard_indices_mapping, 128)
+        # The zip below pairs shard_keys-ordered scales with
+        # processed_mapping keys by insertion order: pin that both agree.
+        assert list(processed_mapping) == \
+            module.weights_loading_config.weight_mode.shard_keys, (
+                f"fused_weight_shard_indices_mapping order "
+                f"{list(processed_mapping)} != shard_keys "
+                f"{module.weights_loading_config.weight_mode.shard_keys}")
         for shard_key, scale in zip(processed_mapping.keys(), scales):
             if scale is not None:
                 shard_offset, shard_size = processed_mapping[shard_key]
@@ -1255,11 +1397,33 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         ]
         processed_mapping = self.remap_fused_shard_indices_by_divisible_factor(
             module.fused_weight_shard_indices_mapping, 128)
+        # Same zip-order pin as the fused-QKV loader above.
+        assert list(processed_mapping) == \
+            module.weights_loading_config.weight_mode.shard_keys, (
+                f"fused_weight_shard_indices_mapping order "
+                f"{list(processed_mapping)} != shard_keys "
+                f"{module.weights_loading_config.weight_mode.shard_keys}")
         for shard_key, scale in zip(processed_mapping.keys(), scales):
             if scale is not None:
                 shard_offset, shard_size = processed_mapping[shard_key]
                 copy_weight_shard(module.weight_scale, scale, shard_offset,
                                   shard_size)
+
+    def reload_covered_units(self, module: Linear,
+                             weights: List[Dict]) -> Dict[str, set]:
+        # 'weight' from the parent; 'weight_scale' mirrors the per-shard
+        # scale gating above (weight-only resend leaves scale debt open).
+        covered = super().reload_covered_units(module, weights)
+        shard_keys = module.weights_loading_config.weight_mode.shard_keys \
+            or ('*', )
+        scale_name = self._get_scale_name(weights)
+        scale_units = {
+            shard
+            for shard, w in zip(shard_keys, weights) if scale_name in w
+        }
+        if scale_units:
+            covered["weight_scale"] = scale_units
+        return covered
 
     def transform_weights(self, module: Linear) -> None:
         super().transform_weights(module)
@@ -1286,6 +1450,16 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 class NVFP4LinearMethod(LinearMethodBase):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+
+    # Purged at pre_reload_weights (see LinearMethodBase); mirrors
+    # _cleanup_nvfp4_tmp_attrs.
+    _RELOAD_TRANSIENT_ATTRS: ClassVar[tuple] = (
+        "tmp_nvfp4_weight_scales",
+        "tmp_nvfp4_input_scales_list",
+        "tmp_nvfp4_weight_scale_2_list",
+        "tmp_k_scales",
+        "tmp_v_scales",
+    )
 
     # Temporary workaround which will be resolved by TRTLLM-11958
     # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
@@ -1893,6 +2067,29 @@ class NVFP4LinearMethod(LinearMethodBase):
                 replace_parameter_and_save_metadata(
                     module, "weight_scale", padded_weight_scale,
                     module.rebuild_tensor_metadata)
+
+    def reload_covered_units(self, module: Linear,
+                             weights: List[Dict]) -> Dict[str, set]:
+        # Per-shard gating mirrors load_weights_* / load_weight_scales.
+        shard_keys = module.weights_loading_config.weight_mode.shard_keys \
+            or ('*', )
+        covered = {}
+        for param_name in ("weight", "weight_scale"):
+            units = {
+                shard
+                for shard, w in zip(shard_keys, weights) if param_name in w
+            }
+            if units:
+                covered[param_name] = units
+        return covered
+
+
+# Linear quant methods whose load_weights_* implement allow_partial_loading.
+# Referenced by both the Linear.load_weights assert and the
+# check_reload_capability preflight. FP8QDQ/FP8Rowwise included via isinstance.
+_PARTIAL_LOADING_CAPABLE_LINEAR_METHODS = (UnquantizedLinearMethod,
+                                           FP8BlockScalesLinearMethod,
+                                           NVFP4LinearMethod)
 
 
 class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
@@ -3463,19 +3660,32 @@ class Linear(nn.Module):
 
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method,
-                          (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
-                           NVFP4LinearMethod)):
+                          _PARTIAL_LOADING_CAPABLE_LINEAR_METHODS):
+            # Backstop for callers that skipped the check_reload_capability
+            # preflight.
             assert allow_partial_loading is False, (
                 f"{type(self.quant_method).__name__} does not support "
                 "allow_partial_loading")
+        # Deliberately NOT delivery-gated (unlike the coverage accounting):
+        # resetting the guard on every call, incl. empty [{}] buckets, is
+        # the pre-existing contract; re-transforming at finalize is safe.
         self._weights_transformed = False
         self.quant_method.load_weights(
             self,
             weights,
             weight_mode,
             allow_partial_loading=allow_partial_loading)
+        # Coverage accounting only AFTER the quant method returned: an
+        # exception above must leave the module vetoed.
+        if allow_partial_loading:
+            consume_reload_coverage(
+                self, self.quant_method.reload_covered_units(self, weights))
+        else:
+            clear_reload_coverage(self)
 
     def process_weights_after_loading(self):
+        # RLHF finalize walk runs PWAL before post_load_weights; veto here too.
+        raise_on_reload_invalidated_module(self, "Linear")
         self.quant_method.process_weights_after_loading(self)
 
     def transform_weights(self) -> None:
@@ -3488,6 +3698,7 @@ class Linear(nn.Module):
         self._weights_transformed = True
 
     def post_load_weights(self) -> None:
+        raise_on_reload_invalidated_module(self, "Linear")
         self.transform_weights()
 
     def pre_reload_weights(self):
@@ -3495,6 +3706,28 @@ class Linear(nn.Module):
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"
         self.quant_method.pre_reload_weights(self)
+
+    def check_reload_capability(self) -> None:
+        """Mutation-free preflight: raise iff this module cannot take part
+        in a hot weight reload.
+
+        Duck-typed by rlhf_utils update_weights: MUST be side-effect-free
+        and MUST NOT touch the device -- a raise refuses the update BEFORE
+        the destructive pre-reload walk, so the bucket stays retryable.
+        """
+        if self.quant_method is None:
+            return
+        if not hasattr(self.quant_method, "pre_reload_weights"):
+            raise NotImplementedError(
+                "pre_reload_weights is not supported for quant method "
+                f"{type(self.quant_method).__name__}")
+        if not isinstance(self.quant_method,
+                          _PARTIAL_LOADING_CAPABLE_LINEAR_METHODS):
+            raise NotImplementedError(
+                f"{type(self.quant_method).__name__} does not support "
+                "allow_partial_loading: bucketed weight reloads could "
+                "never rebuild this Linear once the pre-reload walk tears "
+                "it. Refusing before any mutation.")
 
 
 def is_static_nvfp4_input_eligible(linear) -> bool:

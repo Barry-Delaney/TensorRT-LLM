@@ -50,6 +50,7 @@ from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
+from ..linear import raise_on_reload_invalidated_module
 from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
                       get_cached_perfect_router_logits,
                       precompute_common_perfect_router_logits)
@@ -865,6 +866,7 @@ class MoE(nn.Module):
         self.quant_method.cache_derived_state(self)
 
     def post_load_weights(self) -> None:
+        raise_on_reload_invalidated_module(self, "MoE")
         self.transform_weights()
         self.cache_derived_state()
 
@@ -875,6 +877,8 @@ class MoE(nn.Module):
         When allow_partial_loading=True is used in load_weights(), this method
         must be called separately to complete the loading setup.
         """
+        # RLHF finalize walk runs PWAL before post_load_weights; veto here too.
+        raise_on_reload_invalidated_module(self, "MoE")
         if hasattr(self.quant_method, 'process_weights_after_loading'):
             self.quant_method.process_weights_after_loading(self)
 
@@ -882,6 +886,8 @@ class MoE(nn.Module):
         """
         Prepare tensors for weight reloading by reverting them to their original creation shape.
         """
+        # Backstops for callers that skipped the check_reload_capability
+        # preflight.
         assert hasattr(
             self.quant_method, 'pre_reload_weights'
         ), "pre_reload_weights is not supported for this quant method"
@@ -890,6 +896,26 @@ class MoE(nn.Module):
                 "Weight reloading is not compatible with Expert Parallel Load Balancer (EPLB). "
             )
         self.quant_method.pre_reload_weights(self)
+
+    def check_reload_capability(self) -> None:
+        """Mutation-free preflight: raise iff this MoE cannot take part in a
+        hot weight reload. Contract: see Linear.check_reload_capability
+        (MUST be side-effect-free and MUST NOT touch the device).
+        """
+        if self._using_load_balancer():
+            raise NotImplementedError(
+                "Weight reloading is not compatible with Expert Parallel Load Balancer (EPLB). "
+            )
+        if self.quant_method is not None and not hasattr(
+                self.quant_method, 'pre_reload_weights'):
+            raise NotImplementedError(
+                "pre_reload_weights is not supported for quant method "
+                f"{type(self.quant_method).__name__}")
+        # Duck-typed quant-method leg (FusedMoEMethodBase implements it).
+        quant_check = getattr(self.quant_method, 'check_reload_capability',
+                              None)
+        if callable(quant_check):
+            quant_check(self)
 
     @abstractmethod
     def quantize_input(

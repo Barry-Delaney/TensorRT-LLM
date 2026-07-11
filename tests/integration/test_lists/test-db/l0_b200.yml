@@ -136,6 +136,7 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/test_reload_invalidation_marker.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
@@ -145,6 +146,7 @@ l0_b200:
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_megamoe_streaming_load.py
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
