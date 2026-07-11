@@ -4,7 +4,9 @@ import json
 import struct
 import textwrap
 import weakref
+from contextlib import contextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +14,7 @@ from transformers import PretrainedConfig
 
 # from utils.util import default_dtype
 import tensorrt_llm
+import tensorrt_llm.llmapi.rlhf_utils as rlhf_utils
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
     DeepseekV4CacheManager,
@@ -27,17 +30,20 @@ from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv4 import (
+    DeepseekV4Attention,
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
     DeepseekV4MTP,
+    DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
 )
-from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, UnquantizedLinearMethod
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader, initialize_dummy_weights
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -46,6 +52,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MTPDecodingConfig,
 )
+from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -283,6 +290,16 @@ def test_deepseek_v4_attn_sink_remap():
         remapped["model.layers.0.self_attn.attn_sink"], weights["layers.0.attn.attn_sink"]
     )
 
+    # The MTP sink is re-prefixed to the extra layer index and routes through
+    # the same self_attn loader branch (and thus load_attn_sink) as the main
+    # layers.
+    mtp_remapped = _remap_deepseek_v4_checkpoint_keys(
+        {"mtp.0.attn.attn_sink": torch.arange(4, dtype=torch.float32)},
+        num_hidden_layers=1,
+        kv_lora_rank=448,
+    )
+    assert "model.layers.1.self_attn.attn_sink" in mtp_remapped
+
 
 def test_deepseek_v4_flat_hc_weight_remap():
     weights = {
@@ -401,6 +418,23 @@ def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
     assert "rotate_activation=False" in attention_init
 
 
+class _CudaMarkedTensor:
+    """Proxy over a real CPU tensor that reports ``is_cuda=True``.
+
+    The forward injection gate keys on ``attn_sink.data.is_cuda`` (the C++
+    op takes the raw pointer without a device check), and these unit tests
+    must stay runnable on CPU-only hosts.
+    """
+
+    is_cuda = True
+
+    def __init__(self, tensor):
+        object.__setattr__(self, "_tensor", tensor)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_tensor"), name)
+
+
 def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     captured = {}
 
@@ -416,7 +450,7 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     )
     attn = object.__new__(DeepseekV4TrtllmAttention)
     sink = torch.ones(4, dtype=torch.float32)
-    attn.attn_sink = torch.nn.Parameter(sink, requires_grad=False)
+    attn.attn_sink = SimpleNamespace(data=_CudaMarkedTensor(sink))
 
     metadata = object()
     assert DeepseekV4TrtllmAttention.forward(attn, "q", None, None, metadata) == "ok"
@@ -434,6 +468,753 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     assert "attention_sinks" not in captured
     assert captured["forward_args"].attention_sinks.data_ptr() == sink.data_ptr()
     assert forward_args.attention_sinks is None
+
+    # Device gate: a still-on-CPU pre-registered sink (hook-less harnesses
+    # that never ran the owning module's staged post-load hooks,
+    # post_load_weights / cache_derived_state) must NOT be injected --
+    # attentionOp.cpp reads the raw pointer without a device check, so a
+    # host pointer would reach the CUDA kernel. Null-sink behavior is the
+    # correct fallback.
+    captured.clear()
+    attn.attn_sink = torch.nn.Parameter(sink, requires_grad=False)
+    assert DeepseekV4TrtllmAttention.forward(attn, "q", None, None, metadata) == "ok"
+    assert captured["forward_args"].attention_sinks is None
+
+
+def _make_attention_stub(num_heads_tp=4):
+    """Bare DeepseekV4Attention carrying only the attn_sink surface (the
+    real __init__ needs a GPU-backed MLA tree). ``_weights_transformed`` is
+    pre-set so MLA's transform chain is a no-op on the stub."""
+    stub = object.__new__(DeepseekV4Attention)
+    torch.nn.Module.__init__(stub)
+    stub.num_heads_tp = num_heads_tp
+    stub.mqa = SimpleNamespace()
+    stub._weights_transformed = True
+    stub._register_attn_sink()
+    return stub
+
+
+def test_deepseek_v4_attention_module_owns_attn_sink():
+    """attn_sink must be a Parameter of the DSv4-owned nn.Module.
+
+    Module ownership is what makes it transportable: only
+    module._parameters entries enter state_dict()/named_parameters(), which
+    is exactly what the GMS writer commit (finalize_gms_write /
+    _iter_module_tensors), GMS read-only materialization, and dummy init
+    enumerate. A backend-held Parameter is invisible to all of them. It
+    must also exist with stable storage at construction time: CUDA-graph
+    warmup capture happens at LLM init, before any RLHF update_weights, and
+    -inf is the neutral sink (kernels add exp(sink - max) to the softmax
+    denominator)."""
+    stub = _make_attention_stub(num_heads_tp=64)
+    parent = torch.nn.Module()
+    parent.self_attn = stub
+
+    sink = stub.attn_sink
+    assert isinstance(sink, torch.nn.Parameter)
+    assert sink.requires_grad is False
+    assert sink.dtype == torch.float32
+    assert tuple(sink.shape) == (64,)
+    assert torch.isneginf(sink.data).all()
+    assert stub._attn_sink_loaded is False
+    assert "self_attn.attn_sink" in parent.state_dict()
+    assert "self_attn.attn_sink" in dict(parent.named_parameters())
+    # The backend alias shares the Parameter object, so loader copy_ and
+    # forward injection stay in sync.
+    assert stub.mqa.attn_sink is stub.attn_sink
+
+    # __init__ must register unconditionally (warmup capture needs the
+    # storage before any reload could create it lazily).
+    init_src = inspect.getsource(DeepseekV4Attention.__init__)
+    assert "self._register_attn_sink()" in init_src
+
+
+def test_deepseek_v4_cache_derived_state_rewires_rebound_attn_sink(monkeypatch):
+    """GMS read-only materialization REBINDS module._parameters["attn_sink"]
+    to a new Parameter bound zero-copy to writer-committed shared storage
+    (the CPU-built param never sees model.to("cuda") on the GMS path), so
+    cache_derived_state must re-wire the backend alias to the transported
+    Parameter and must NOT write it: the receiver's local _attn_sink_loaded
+    flag is still False while the storage holds real values shared with the
+    writer and every peer."""
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    stub = _make_attention_stub()
+    values = torch.tensor([0.5, -1.0, 2.0, 0.0], dtype=torch.float32)
+    transported = torch.nn.Parameter(values.clone(), requires_grad=False)
+    ptr = transported.data_ptr()
+    # Mirror of the upstream materializer's rebind statement.
+    stub._parameters["attn_sink"] = transported
+
+    DeepseekV4Attention.cache_derived_state(stub)
+
+    assert stub.mqa.attn_sink is transported
+    assert torch.equal(transported.data, values)  # no -inf refill
+    assert transported.data_ptr() == ptr
+    assert stub._attn_sink_loaded is False
+
+
+def test_deepseek_v4_attn_sink_stage_preservation_semantics(monkeypatch):
+    """Both staged hooks are VALUE-PRESERVING for attn_sink. Dummy init must
+    skip it at the source (suffix skip-list in initialize_dummy_weights;
+    exp(-inf) == 0 is the exact no-sink math) while still randomizing
+    sibling params. Direct-write transports (MX P2P) deliver real values
+    with _attn_sink_loaded still False, and repeated finalize sweeps must
+    preserve them without rebinding .data (captured graphs bake the device
+    pointer). cache_derived_state (read-only stage) never writes either."""
+    if not torch.cuda.is_available():
+        # The one-time CUDA migration is exercised on GPU runners; keep the
+        # value/flag/pointer contract testable on CPU-only hosts.
+        monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+
+    stub = _make_attention_stub()
+    parent = torch.nn.Module()
+    parent.self_attn = stub
+    parent.probe = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+    # (a) dummy init: the ctor -inf survives via the source-level skip while
+    # a sibling fp32 Parameter IS randomized (the skip is suffix-scoped).
+    initialize_dummy_weights(parent)
+    assert torch.isneginf(stub.attn_sink.data).all()
+    assert not torch.equal(parent.probe.data, torch.zeros(4))
+    DeepseekV4Attention.post_load_weights(stub)
+    assert torch.isneginf(stub.attn_sink.data.cpu()).all()
+    if torch.cuda.is_available():
+        assert stub.attn_sink.data.is_cuda
+    ptr = stub.attn_sink.data_ptr()
+
+    # (b) MX-P2P-style direct Parameter write: real values land WITHOUT
+    # load_attn_sink (diagnostic flag stays False); the full post-load walk
+    # must preserve them across repeated sweeps, pointer stable. This is
+    # the direct regression test for the flag-gated refill.
+    transported = torch.tensor([0.5, -1.0, 2.0, 0.0], dtype=torch.float32)
+    stub.attn_sink.data.copy_(transported)
+    assert stub._attn_sink_loaded is False
+    DeepseekV4Attention.post_load_weights(stub)
+    DeepseekV4Attention.post_load_weights(stub)  # finalize sweeps repeat
+    assert torch.equal(stub.attn_sink.data.cpu(), transported)
+    assert stub.attn_sink.data_ptr() == ptr
+    assert stub.mqa.attn_sink is stub.attn_sink
+
+    # (c) loader-delivered values behave identically (flag is diagnostic
+    # only, it gates nothing).
+    loaded = torch.tensor([1.5, 2.5, 3.5, 4.5], dtype=torch.float32)
+    stub.attn_sink.data.copy_(loaded)
+    stub._attn_sink_loaded = True
+    DeepseekV4Attention.post_load_weights(stub)
+    assert torch.equal(stub.attn_sink.data.cpu(), loaded)
+    assert stub.attn_sink.data_ptr() == ptr
+
+    # (d) the read-only stage must not write even with the flag unset and
+    # non-neutral values (RO receivers hold writer-transported real values).
+    stub_ro = _make_attention_stub()
+    stub_ro.attn_sink.data.copy_(transported)
+    DeepseekV4Attention.cache_derived_state(stub_ro)
+    assert torch.equal(stub_ro.attn_sink.data.cpu(), transported)
+
+
+def test_deepseek_v4_attn_sink_ctor_value_survives_meta_init_mode():
+    """Executable contract for what _register_attn_sink relies on:
+    MetaInitMode intercepts only aten.empty/empty_like, so torch.full (no
+    tensor args) executes for real on CPU -- the -inf ctor value exists as
+    real bytes that later allocation stages must preserve."""
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+
+    with MetaInitMode():
+        sink = torch.nn.Parameter(
+            torch.full((4,), float("-inf"), dtype=torch.float32), requires_grad=False
+        )
+        probe = torch.empty(4)
+
+    assert sink.device.type == "cpu"
+    assert torch.isneginf(sink).all()
+    assert probe.device.type == "meta"  # the mode WAS active around both
+
+
+def test_initialize_dummy_weights_skips_attn_sink_suffix():
+    """Shared-layer contract for the dummy initializer: the ``.attn_sink``
+    suffix skip preserves ctor values for ANY module registering the param
+    (the neutral value is the correct dummy sink), while suffix scoping
+    keeps the skip from swallowing similarly named params."""
+    model = torch.nn.Module()
+    inner = torch.nn.Module()
+    model.self_attn = inner
+    inner.attn_sink = torch.nn.Parameter(
+        torch.full((3,), float("-inf"), dtype=torch.float32), requires_grad=False
+    )
+    inner.attn_sink_bias = torch.nn.Parameter(torch.zeros(3), requires_grad=False)
+    model.weight = torch.nn.Parameter(torch.zeros(3), requires_grad=False)
+
+    initialize_dummy_weights(model)
+
+    assert torch.isneginf(inner.attn_sink.data).all()
+    assert not torch.equal(inner.attn_sink_bias.data, torch.zeros(3))
+    assert not torch.equal(model.weight.data, torch.zeros(3))
+
+
+def test_deepseek_v4_attn_sink_reached_by_model_loader_walks(monkeypatch):
+    """The GMS read-only loader branch runs ONLY ModelLoader._walk_cache_state
+    and the full/dummy branches run _walk_full_post_load: with the round-9
+    model-level backend sweep gone, both real walks must reach the
+    module-level staged hooks (rebind re-wire on the cache walk,
+    value-preserving migration + re-wire on the full walk)."""
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    root = _make_causal_lm_stub()
+    attn = _make_attention_stub()
+    root.attn = attn
+
+    rebound = torch.nn.Parameter(
+        torch.tensor([9.0, 8.0, 7.0, 6.0], dtype=torch.float32), requires_grad=False
+    )
+    attn._parameters["attn_sink"] = rebound  # upstream RO rebind
+
+    ModelLoader._walk_cache_state(root)
+    # Read-only stage: alias re-wired to the transported Parameter, values
+    # untouched.
+    assert attn.mqa.attn_sink is rebound
+    assert torch.equal(rebound.data, torch.tensor([9.0, 8.0, 7.0, 6.0]))
+
+    ModelLoader._walk_full_post_load(root)
+    # Writer stage is value-preserving too: directly transported values
+    # (diagnostic flag never set) survive the full walk -- no -inf refill.
+    assert torch.equal(attn.attn_sink.data, torch.tensor([9.0, 8.0, 7.0, 6.0]))
+    assert attn.attn_sink is rebound
+    assert attn.mqa.attn_sink is attn.attn_sink
+
+
+def test_deepseek_v4_load_attn_sink_refreshes_in_place():
+    """Reload must copy_ into the module-owned pre-registered storage (never
+    rebind: the captured CUDA graph baked this pointer), apply the per-head
+    TP split, and latch _attn_sink_loaded on the owner module."""
+    loader = object.__new__(DeepseekV4WeightLoader)
+    loader.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(enable_attention_dp=False, tp_size=2, tp_rank=1)
+    )
+    owner = _make_attention_stub(num_heads_tp=8)
+    ptr = owner.attn_sink.data_ptr()
+
+    sink_src = torch.arange(16, dtype=torch.float32)
+    loader.load_attn_sink(owner, sink_src)
+    assert owner.attn_sink.data_ptr() == ptr
+    assert torch.equal(owner.attn_sink.data, sink_src[8:])
+    assert owner._attn_sink_loaded is True
+    # The backend alias observes the refresh through the shared object.
+    assert owner.mqa.attn_sink is owner.attn_sink
+    assert torch.equal(owner.mqa.attn_sink.data, sink_src[8:])
+
+    # Shape drift across reloads must fail loudly, not corrupt storage.
+    with pytest.raises(ValueError, match="attn_sink shape changed"):
+        loader.load_attn_sink(owner, torch.arange(8, dtype=torch.float32))
+    assert torch.equal(owner.attn_sink.data, sink_src[8:])
+
+    # Under attention DP (tp_size == 1 mapping) the full sink is kept.
+    loader.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(enable_attention_dp=True, tp_size=1, tp_rank=0)
+    )
+    owner_dp = _make_attention_stub(num_heads_tp=16)
+    loader.load_attn_sink(owner_dp, sink_src)
+    assert torch.equal(owner_dp.attn_sink.data, sink_src)
+
+
+def _make_causal_lm_stub():
+    """Bare DeepseekV4ForCausalLM carrying only the partial-reload hook
+    state (the real __init__ needs a GPU-backed model tree). ``config`` is
+    a read-only property forwarding to ``model_config.pretrained_config``.
+    """
+    stub = object.__new__(DeepseekV4ForCausalLM)
+    torch.nn.Module.__init__(stub)
+    stub.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(num_hidden_layers=0))
+    stub.model = SimpleNamespace(layers=[])
+    return stub
+
+
+def test_deepseek_v4_abort_reload_cycle_hook():
+    """Public duck-typed hook for the WorkerExtension exception boundary:
+    CPU-only attribute manipulation, idempotent, taints the cycle's keys and
+    clears the latch + fresh flag."""
+    stub = _make_causal_lm_stub()
+    stub.pre_reload_weights()
+    stub.first_pre_reload_weights = True  # rlhf_utils once-per-sweep latch
+    stub._partial_group_stash["k"] = torch.zeros(1)
+    stub._partial_reload_cycle_keys.update({"a", "b"})
+
+    stub.abort_reload_cycle("RuntimeError('boom')")
+
+    assert stub._partial_reload_failed == "RuntimeError('boom')"
+    assert not hasattr(stub, "first_pre_reload_weights")
+    assert "_partial_group_stash" not in stub.__dict__
+    assert stub._partial_reload_tainted_keys == {"a", "b"}
+    assert stub._partial_reload_fresh is False
+
+    # Idempotent double-abort (in-load abort followed by the boundary
+    # abort): only the reason is refreshed, the taint union is stable.
+    stub.abort_reload_cycle("RuntimeError('boom2')")
+    assert stub._partial_reload_failed == "RuntimeError('boom2')"
+    assert stub._partial_reload_tainted_keys == {"a", "b"}
+
+
+def test_deepseek_v4_finalize_retry_after_leftovers_keeps_failing():
+    """A finalize retry after a leftovers abort must fail again: the audit
+    drops the stash before raising, so without the sticky failure flag the
+    retry's vacuous pre_reload + empty-stash audit would report the
+    incomplete update as SUCCESS."""
+    stub = _make_causal_lm_stub()
+    stub.pre_reload_weights()
+    stub.first_pre_reload_weights = True  # rlhf_utils once-per-sweep latch
+    leftover_key = "model.layers.0.self_attn.o_a_proj"
+    stub._partial_group_stash[leftover_key] = torch.zeros(1)
+    # Flow-faithful: the bucket that stashed this key pre-registered it in
+    # the cycle key set before the loader ran.
+    stub._partial_reload_cycle_keys.add(leftover_key)
+
+    with pytest.raises(ValueError, match="never completed"):
+        stub.post_load_weights()
+    # The abort must clear the rlhf latch so the next update_weights call
+    # re-runs the full pre_reload walk (recovery by covering resend) and
+    # taint the cycle's keys.
+    assert not hasattr(stub, "first_pre_reload_weights")
+    assert stub._partial_reload_failed
+    assert leftover_key in stub._partial_reload_tainted_keys
+
+    # Recovery-sweep-without-data shape: rlhf's bare finalize never runs the
+    # walk anymore, so pre_reload here models a recovery sweep whose data
+    # bucket re-opened the cycle without re-delivering anything -> the
+    # coverage audit must raise AGAIN at finalize.
+    stub.pre_reload_weights()
+    with pytest.raises(RuntimeError, match="partial-reload cycle failed"):
+        stub.post_load_weights()
+
+
+def test_deepseek_v4_partial_reload_abort_protocol(monkeypatch):
+    """A bucket failure aborts the cycle: latch cleared + failure latched +
+    stash dropped + the whole bucket tainted; later buckets without a fresh
+    pre_reload are refused; only a finalize whose cycle re-delivered every
+    tainted key forgives."""
+
+    def boom(self, weights, allow_partial_loading=False):
+        raise RuntimeError("boom")
+
+    def ok(self, weights, allow_partial_loading=False):
+        pass
+
+    key_a = "model.layers.0.self_attn.o_a_proj"
+    key_b = "model.layers.1.self_attn.o_a_proj"
+
+    stub = _make_causal_lm_stub()
+    stub.pre_reload_weights()
+    stub.first_pre_reload_weights = True  # rlhf_utils once-per-sweep latch
+
+    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        stub.load_weights(
+            {key_a: torch.zeros(1), key_b: torch.zeros(1)}, allow_partial_loading=True
+        )
+    assert not hasattr(stub, "first_pre_reload_weights")
+    assert stub._partial_reload_failed
+    assert "_partial_group_stash" not in stub.__dict__
+    # The whole failing bucket was pre-registered, so every key it carried
+    # is tainted (keys applied before the exception and async copies
+    # included).
+    assert stub._partial_reload_tainted_keys == {key_a, key_b}
+
+    # A bucket WITHOUT a fresh pre_reload merges into the aborted cycle's
+    # state and must be refused (the abort cleared the fresh flag).
+    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", ok)
+    with pytest.raises(RuntimeError, match="fresh sweep starting with pre_reload_weights"):
+        stub.load_weights({key_a: torch.zeros(1)}, allow_partial_loading=True)
+
+    # A direct finalize WITHOUT an intervening pre_reload must be refused
+    # too: the aborted cycle's own pre-registered keys would cover
+    # themselves (missing == tainted - cycle_keys == empty), forgiving
+    # half-applied params.
+    with pytest.raises(RuntimeError, match="pre_reload_weights is required"):
+        stub.post_load_weights()
+    assert stub._partial_reload_failed  # still latched
+
+    # A recovery cycle that re-delivers nothing (pre_reload + finalize,
+    # no data) keeps failing.
+    stub.pre_reload_weights()
+    with pytest.raises(RuntimeError, match="did not resend"):
+        stub.post_load_weights()
+
+    # Recovery: a covering resend split across TWO buckets. Data buckets no
+    # longer clear the failure (only the finalize coverage audit does), and
+    # bucket B must not be refused after bucket A: fresh is abort-cleared,
+    # not consumed per bucket -- a naive "just stop clearing failed" fix
+    # would spuriously raise "fresh full sweep" here.
+    stub.pre_reload_weights()
+    stub.load_weights({key_a: torch.zeros(1)}, allow_partial_loading=True)
+    assert stub._partial_reload_failed  # sticky until the finalize audit
+    stub.load_weights({key_b: torch.zeros(1)}, allow_partial_loading=True)
+    stub.post_load_weights()
+    assert getattr(stub, "_partial_reload_failed", None) is None
+    assert stub._partial_reload_tainted_keys == set()
+    assert stub._partial_reload_fresh is False
+
+    # The initial full (non-partial) load path involves none of the flags.
+    fresh_stub = _make_causal_lm_stub()
+    fresh_stub.load_weights({}, allow_partial_loading=False)
+    assert getattr(fresh_stub, "_partial_reload_failed", None) is None
+    assert not hasattr(fresh_stub, "_partial_reload_fresh")
+    assert not hasattr(fresh_stub, "_partial_reload_cycle_keys")
+
+
+def test_deepseek_v4_empty_bucket_does_not_forgive_failed_cycle(monkeypatch):
+    """After an aborted cycle, a fresh cycle whose only bucket is {} (or any
+    non-covering subset) must NOT be reported as success -- the model still
+    mixes checkpoints. Only a cycle re-delivering every tainted key clears
+    the failure. (Round-9 semantics blessed the empty-bucket 'recovery'.)"""
+
+    def boom(self, weights, allow_partial_loading=False):
+        raise RuntimeError("boom")
+
+    def ok(self, weights, allow_partial_loading=False):
+        pass
+
+    key_a = "model.layers.0.self_attn.o_a_proj"
+    key_b = "model.layers.1.self_attn.o_a_proj"
+
+    stub = _make_causal_lm_stub()
+    stub.pre_reload_weights()
+    stub.first_pre_reload_weights = True  # rlhf_utils once-per-sweep latch
+    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        stub.load_weights({key_a: torch.zeros(1)}, allow_partial_loading=True)
+
+    # Empty-bucket "recovery": the bucket call itself is a legal no-op...
+    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", ok)
+    stub.pre_reload_weights()
+    stub.load_weights({}, allow_partial_loading=True)
+    assert stub._partial_reload_failed  # data buckets no longer forgive
+    # ...but finalize must refuse to bless the mixed-checkpoint model.
+    with pytest.raises(RuntimeError, match="did not resend"):
+        stub.post_load_weights()
+
+    # Non-covering resend: keeps failing AND its own keys join the tainted
+    # set (union across consecutive failed cycles).
+    stub.pre_reload_weights()
+    stub.load_weights({key_b: torch.zeros(1)}, allow_partial_loading=True)
+    with pytest.raises(RuntimeError, match="did not resend"):
+        stub.post_load_weights()
+    assert stub._partial_reload_tainted_keys == {key_a, key_b}
+
+    # Covering resend: genuine recovery still works.
+    stub.pre_reload_weights()
+    stub.load_weights({key_a: torch.zeros(1), key_b: torch.zeros(1)}, allow_partial_loading=True)
+    stub.post_load_weights()
+    assert getattr(stub, "_partial_reload_failed", None) is None
+    assert stub._partial_reload_tainted_keys == set()
+
+
+def _make_stub_worker_extension(model, monkeypatch):
+    """Real WorkerExtension over a stub engine. ``reload`` forwards buckets
+    into model.load_weights the way model_loader.reload does on the partial
+    path; CUDA calls are stubbed for CPU-only hosts."""
+
+    @contextmanager
+    def control_action(drain=True):
+        yield
+
+    def reload(mdl, weights, allow_partial_loading=False):
+        mdl.load_weights(weights, allow_partial_loading=allow_partial_loading)
+
+    ext = object.__new__(WorkerExtension)
+    ext.device_id = 0
+    ext.engine = SimpleNamespace(
+        control_action=control_action,
+        model_engine=SimpleNamespace(model=model, model_loader=SimpleNamespace(reload=reload)),
+        reset_prefix_cache=lambda: None,
+    )
+    monkeypatch.setattr(rlhf_utils, "get_device_uuid", lambda device_id: "uuid-0")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    return ext
+
+
+def _ipc_bucket(weights):
+    handles = [
+        (name, (lambda *args, _t=tensor: _t, (0, 0, 0, 0, 0, 0, 0)))
+        for name, tensor in weights.items()
+    ]
+    return {"uuid-0": handles}
+
+
+def test_deepseek_v4_finalize_exception_boundary_forces_fresh_cycle(monkeypatch):
+    """An exception OUTSIDE model.load_weights (another module's finalize
+    hook) must abort the DSv4 cycle at the WorkerExtension boundary via the
+    duck-typed abort_reload_cycle hook: sticky failure + tainted keys +
+    latch cleared. A bare finalize retry then fails deterministically (no
+    vacuous torn-success) and a covering resend recovers."""
+
+    class _FinalizeBoom(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.armed = True
+            self.pre_reload_calls = 0
+
+        def pre_reload_weights(self):
+            self.pre_reload_calls += 1
+
+        def process_weights_after_loading(self):
+            if self.armed:
+                raise RuntimeError("finalize boom")
+
+    def ok(self, weights, allow_partial_loading=False):
+        pass
+
+    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", ok)
+    key = "model.layers.0.self_attn.o_a_proj"
+    stub = _make_causal_lm_stub()
+    boom_child = _FinalizeBoom()
+    stub.boom_child = boom_child
+    ext = _make_stub_worker_extension(stub, monkeypatch)
+
+    # Cycle 1: data bucket ok, then the finalize walk fails in ANOTHER
+    # module -- outside the model's own load_weights abort scope, so only
+    # the boundary abort can invalidate the cycle.
+    ext.update_weights(_ipc_bucket({key: torch.zeros(1)}))
+    assert boom_child.pre_reload_calls == 1
+    with pytest.raises(RuntimeError, match="finalize boom"):
+        ext.update_weights(None)
+    assert stub._partial_reload_failed
+    assert key in stub._partial_reload_tainted_keys
+    assert not hasattr(stub, "first_pre_reload_weights")
+
+    # Bare finalize retry: no data bucket arrives, so the finalize branch no
+    # longer re-runs the (destructive) pre-hook walk -- the abort cleared
+    # the fresh flag, and the DSv4 fresh-guard refuses deterministically
+    # instead of blessing a torn model.
+    boom_child.armed = False
+    with pytest.raises(RuntimeError, match="fresh sweep starting with pre_reload_weights"):
+        ext.update_weights(None)
+    assert boom_child.pre_reload_calls == 1  # bare finalize destroys nothing
+
+    # Recovery: a fresh covering sweep (its data bucket re-runs the
+    # pre-hook walk), then finalize succeeds and clears every flag.
+    ext.update_weights(_ipc_bucket({key: torch.zeros(1)}))
+    assert boom_child.pre_reload_calls == 2
+    ext.update_weights(None)
+    assert getattr(stub, "_partial_reload_failed", None) is None
+    assert stub._partial_reload_tainted_keys == set()
+    assert not hasattr(stub, "first_pre_reload_weights")
+
+
+class _DestructivePreReloadChild(torch.nn.Module):
+    """Coverage-protocol module standing in for a transformed Linear: its
+    pre_reload replaces params with uninitialized storage (counted) and
+    opens the per-param coverage debt (``_reload_outstanding``); finalize
+    refuses while any unit is outstanding (mirrors
+    ``Linear.post_load_weights``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.pre_reload_calls = 0
+
+    def pre_reload_weights(self):
+        self.pre_reload_calls += 1
+        self._reload_outstanding = {"weight": {"*"}}
+
+    def post_load_weights(self):
+        if getattr(self, "_reload_outstanding", None):
+            raise RuntimeError(
+                "module finalized without reloading invalidated params: "
+                "it would serve uninitialized memory"
+            )
+
+
+def test_deepseek_v4_deser_only_failure_leaves_cycle_untouched(monkeypatch):
+    """A failure BEFORE any bucket reaches load_weights (here: the
+    device-uuid lookup, standing in for IPC deserialization failures) now
+    precedes the pre-hook walk AND the try/abort boundary: nothing is
+    destroyed, nothing is aborted, no latch is set. This ordering is what
+    keeps the empty-taint finalize forgiveness truthful -- the walk itself
+    mutates working weights, so it must never run for a bucket that cannot
+    be applied."""
+
+    child = _DestructivePreReloadChild()
+
+    def deliver(self, weights, allow_partial_loading=False):
+        # Loader-side delivery rewrites the destroyed module's params and
+        # consumes its coverage (the generic point is Linear.load_weights).
+        child._reload_outstanding = {}
+
+    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", deliver)
+    stub = _make_causal_lm_stub()
+    stub.destructive_child = child
+    ext = _make_stub_worker_extension(stub, monkeypatch)
+
+    with pytest.raises(ValueError, match="not found in ipc_handles"):
+        ext.update_weights({"other-uuid": []})
+    # Load-bearing: the walk never ran, so nothing was destroyed, nothing
+    # was aborted, and the (empty) taint is genuinely truthful.
+    assert child.pre_reload_calls == 0
+    assert getattr(child, "_reload_outstanding", None) is None
+    assert getattr(stub, "_partial_reload_failed", None) is None
+    assert getattr(stub, "_partial_reload_tainted_keys", set()) == set()
+    assert not hasattr(stub, "first_pre_reload_weights")
+
+    # The cycle that never opened needs no recovery: a normal bucket +
+    # finalize succeeds with exactly one destructive walk.
+    ext.update_weights(_ipc_bucket({"model.layers.0.self_attn.o_a_proj": torch.zeros(1)}))
+    assert child.pre_reload_calls == 1
+    ext.update_weights(None)
+    assert getattr(stub, "_partial_reload_failed", None) is None
+    assert not hasattr(stub, "first_pre_reload_weights")
+
+
+def test_deepseek_v4_invalidated_module_blocks_non_covering_recovery(monkeypatch):
+    """Closes the pre-hook destruction blind spot behind the key-coverage
+    audit: cycle 1's walk destroys a transformed-Linear-like child before
+    the cycle fails in-load. A recovery sweep re-covering ONLY the tainted
+    key passes the key audit (missing == empty) while the destroyed child
+    still holds uninitialized storage -- the per-module invalidation marker
+    must veto at finalize. A sweep that also re-delivers the child
+    recovers."""
+
+    key_a = "model.layers.0.self_attn.o_a_proj"
+    child_key = "model.layers.1.destructive_child.weight"
+
+    child = _DestructivePreReloadChild()
+    mode = {"boom": True}
+
+    def loader(self, weights, allow_partial_loading=False):
+        if mode["boom"]:
+            raise RuntimeError("in-load boom")
+        if child_key in weights:
+            child._reload_outstanding = {}
+
+    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", loader)
+    stub = _make_causal_lm_stub()
+    stub.destructive_child = child
+    ext = _make_stub_worker_extension(stub, monkeypatch)
+
+    # Cycle 1: the walk destroys the child, then bucket A fails in-load.
+    with pytest.raises(RuntimeError, match="in-load boom"):
+        ext.update_weights(_ipc_bucket({key_a: torch.zeros(1)}))
+    assert child.pre_reload_calls == 1
+    assert stub._partial_reload_tainted_keys == {key_a}
+
+    # Non-covering recovery (tainted key only): the key audit forgives but
+    # the child was never re-delivered -- its marker raises at finalize and
+    # the boundary abort re-latches the sticky failure.
+    mode["boom"] = False
+    ext.update_weights(_ipc_bucket({key_a: torch.zeros(1)}))
+    assert child.pre_reload_calls == 2  # the fresh walk destroyed it again
+    with pytest.raises(RuntimeError, match="uninitialized memory"):
+        ext.update_weights(None)
+    assert stub._partial_reload_failed
+    assert not hasattr(stub, "first_pre_reload_weights")
+
+    # Covering sweep that also re-delivers the child: marker cleared, key
+    # audit passes, finalize succeeds and clears every flag.
+    ext.update_weights(_ipc_bucket({key_a: torch.zeros(1), child_key: torch.zeros(1)}))
+    assert child.pre_reload_calls == 3
+    ext.update_weights(None)
+    assert getattr(stub, "_partial_reload_failed", None) is None
+    assert stub._partial_reload_tainted_keys == set()
+    assert not child._reload_outstanding
+
+
+def _make_fused_a_partial_stub():
+    """DeepseekV4ForCausalLM stub with a REAL Linear wired at the fused-A
+    loader position (lite config: the atomic group is kv_a_proj_with_mqa
+    alone), carrying FP8-blockwise-style rebuild metadata: pre_reload
+    invalidated BOTH weight and weight_scale (marker set manually to keep
+    the test CPU-only)."""
+    lin = object.__new__(Linear)
+    torch.nn.Module.__init__(lin)
+    lin.quant_method = UnquantizedLinearMethod()  # not NVFP4: fp8-blockwise shape
+    lin.weight = torch.nn.Parameter(torch.zeros(4, 8), requires_grad=False)
+    lin.weight_scale = torch.nn.Parameter(torch.zeros(1, 1), requires_grad=False)
+    lin.rebuild_tensor_metadata = {
+        "weight": {"meta": torch.empty(4, 8)},
+        "weight_scale": {"meta": torch.empty(1, 1)},
+    }
+    lin._weights_transformed = False
+    # As opened by LinearMethodBase.pre_reload_weights (init_reload_coverage).
+    lin._reload_outstanding = {"weight": {"*"}, "weight_scale": {"*"}}
+
+    self_attn = torch.nn.Module()
+    self_attn.kv_a_proj_with_mqa = lin
+    layer = torch.nn.Module()
+    layer.self_attn = self_attn
+    layer.fusion_config = SimpleNamespace(POST_MOE_FUSION=True)
+    inner = torch.nn.Module()
+    inner.layers = torch.nn.ModuleList([layer])
+
+    stub = object.__new__(DeepseekV4ForCausalLM)
+    torch.nn.Module.__init__(stub)
+    stub.model = inner
+    stub.model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            num_hidden_layers=1,
+            q_lora_rank=None,  # lite: the fused-A group is kv_a_proj_with_mqa only
+            num_attention_heads=1,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            kv_lora_rank=8,
+        ),
+        mapping=SimpleNamespace(
+            tp_rank=0, tp_size=1, cp_rank=0, cp_size=1, enable_attention_dp=False
+        ),
+        get_quant_config=lambda: QuantConfig(),
+        quant_config=QuantConfig(),
+    )
+    return stub, lin
+
+
+def test_deepseek_v4_fused_a_scale_less_delivery_stalls_and_keeps_marker():
+    """Blocker-2 regression: the fused-A required set keys on MODULE state.
+
+    On a scale-owning module (FP8-blockwise: pre_reload invalidates weight
+    AND weight_scale) a bf16-anchor delivery without weight_scale_inv must
+    NOT complete the group: the old dtype-keyed requirement would write the
+    weight, skip the scale, and clear the invalidation marker over
+    empty_like garbage scales. The delivery must instead stall in the
+    stash (nothing written, marker set, finalize vetoes loudly)."""
+    stub, lin = _make_fused_a_partial_stub()
+    w_key = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+
+    stub.pre_reload_weights()
+    stub.load_weights({w_key: torch.ones(4, 8, dtype=torch.bfloat16)}, allow_partial_loading=True)
+
+    # Coverage NOT vacuously consumed (nothing was written).
+    assert lin._reload_outstanding == {"weight": {"*"}, "weight_scale": {"*"}}
+    assert torch.equal(lin.weight.data, torch.zeros(4, 8))  # no half-write
+    assert w_key in stub._partial_group_stash  # stalled awaiting the scale
+    # Module-level veto holds (both finalize hooks)...
+    with pytest.raises(RuntimeError, match="uninitialized memory"):
+        lin.post_load_weights()
+    with pytest.raises(RuntimeError, match="uninitialized memory"):
+        lin.process_weights_after_loading()
+    # ...and the model-level leftover audit fails the sweep loudly.
+    with pytest.raises(ValueError, match="never completed"):
+        stub.post_load_weights()
+
+
+def test_deepseek_v4_fused_a_full_delivery_writes_scale_and_clears_marker():
+    """Complement of the stall test: a delivery carrying the full
+    {weight, weight_scale_inv} group flows through the fused-A arm, writes
+    both invalidated params, clears the marker, and finalizes cleanly."""
+    stub, lin = _make_fused_a_partial_stub()
+    w_key = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+    s_key = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv"
+
+    stub.pre_reload_weights()
+    stub.load_weights(
+        {
+            w_key: torch.ones(4, 8, dtype=torch.bfloat16),
+            s_key: torch.full((1, 1), 0.5),
+        },
+        allow_partial_loading=True,
+    )
+
+    assert not lin._reload_outstanding
+    assert torch.equal(lin.weight.data, torch.ones(4, 8))
+    assert torch.equal(lin.weight_scale.data, torch.full((1, 1), 0.5))
+    lin.post_load_weights()  # no veto once re-delivered
+    stub.post_load_weights()  # no leftovers, no taint
+    assert getattr(stub, "_partial_reload_failed", None) is None
 
 
 def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):

@@ -1468,8 +1468,14 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         **kwargs,
     ):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        # The sink Parameter is owned by the DSv4 attention nn.Module and
+        # aliased onto this backend; directly-constructed backends lack it
+        # and get null-sink behavior -- do not lazily create it here.
         attn_sink = getattr(self, "attn_sink", None)
-        if attn_sink is not None:
+        # is_cuda gate: attentionOp.cpp checks dtype but NOT device; a
+        # still-on-CPU Parameter (forward before post-load hooks migrated it)
+        # would hand a HOST pointer to the kernel -- fall back to null-sink.
+        if attn_sink is not None and attn_sink.data.is_cuda:
             if forward_args.attention_sinks is None:
                 forward_args = replace(forward_args, attention_sinks=attn_sink.data)
 

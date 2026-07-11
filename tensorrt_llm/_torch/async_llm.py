@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from typing import Any, List, Optional
 
 from ..llmapi.llm import LLM
@@ -62,12 +76,17 @@ class AsyncLLM(LLM):
         """
         await self.collective_rpc("wakeup", args=(tags,))
 
-    async def update_weights(self, weights: dict[str, str]):
+    async def update_weights(self, weights: Optional[dict]):
         """Update the weights of the LLM asynchronously.
 
+        Multi-bucket sweeps are not engine-atomic: bracket them with
+        ``pause_generation()``/``resume_generation()``; broadcast
+        ``abort_update_weights`` before retrying a failed sweep (see
+        ``WorkerExtension.update_weights``).
 
         Args:
-            weights: Dictionary mapping device UUIDs to IPC handles for weight tensors.
+            weights: Dictionary mapping device UUIDs to IPC handles for
+                weight tensors, or ``None`` to finalize a bucketed update.
         """
         await self.collective_rpc("update_weights", args=(weights,))
 
