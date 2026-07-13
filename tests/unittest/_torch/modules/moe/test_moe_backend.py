@@ -476,6 +476,142 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         method.post_load_weights(DummyModule())
 
 
+def _make_megamoe_cutedsl_for_ctor_test(**ctor_overrides):
+    """Construct a single-rank MegaMoECuteDsl with weight creation skipped.
+
+    Exercises only the constructor-time validation paths; no CUDA kernel,
+    quant method, or symmetric provider is touched.
+    """
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+    )
+    kwargs = dict(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        init_load_balancer=False,
+    )
+    kwargs.update(ctor_overrides)
+    return MegaMoECuteDsl(**kwargs)
+
+
+def test_megamoe_cutedsl_rejects_unknown_combine_format():
+    with pytest.raises(ValueError, match=r"combine_format must be one of"):
+        _make_megamoe_cutedsl_for_ctor_test(combine_format="fp8")
+
+
+@pytest.mark.parametrize("combine_format", ["bf16", "32e4m3xe8m0", "16e2m1xbf16"])
+def test_megamoe_cutedsl_accepts_supported_combine_formats(combine_format):
+    moe = _make_megamoe_cutedsl_for_ctor_test(combine_format=combine_format)
+    assert moe.combine_format == combine_format
+
+
+def test_megamoe_cutedsl_quantized_combine_disables_in_kernel_reduce():
+    # Quantized combine requires the separate-reduce path; the constructor
+    # must drop the incompatible in-kernel reduce (bf16 keeps it).
+    moe = _make_megamoe_cutedsl_for_ctor_test(
+        combine_format="32e4m3xe8m0", in_kernel_fc2_reduce=True
+    )
+    assert moe.in_kernel_fc2_reduce is False
+    moe_bf16 = _make_megamoe_cutedsl_for_ctor_test(combine_format="bf16", in_kernel_fc2_reduce=True)
+    assert moe_bf16.in_kernel_fc2_reduce is True
+
+
+def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(monkeypatch):
+    # With the tactic_autotune opt-IN, AutoTuner tuning mode must pin launches
+    # to the TOP adaptive bucket (the profiling scratch is sized for it and
+    # the tuned cache is keyed on its max_tokens_per_rank); outside tuning
+    # mode the hint picks the smallest fitting bucket as before. Opted OUT
+    # (default), tuning mode must be invisible: no sweep runs, so the normal
+    # adaptive bucket choice stays in effect.
+    moe = _make_megamoe_cutedsl_for_ctor_test(tactic_autotune=True)
+    buckets = moe._maxt_buckets
+    assert len(buckets) >= 2, f"expected a multi-bucket ladder, got {buckets}"
+    small_hint = buckets[0]
+    assert moe._select_launch_max_tokens(small_hint) == buckets[0]
+    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
+    assert moe._select_launch_max_tokens(small_hint) == buckets[-1]
+    moe_default = _make_megamoe_cutedsl_for_ctor_test()
+    assert moe_default._select_launch_max_tokens(small_hint) == buckets[0]
+
+
+def test_megamoe_cutedsl_tactic_autotune_defaults_off():
+    # The tactic-autotune opt-in must default OFF so standard serving never
+    # pays the MegaMoE MERGE tactic sweep during autotuner warmup. Without
+    # the flag the backend records NO profiling-scratch request, so the op's
+    # deferred scratch factory can never be built (no multi-GiB symmetric
+    # profiling allocation) and the op goes straight to the deterministic
+    # tactic=-1 heuristic.
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    assert moe.tactic_autotune is False
+    assert moe._profiling_scratch_kwargs is None
+    moe_on = _make_megamoe_cutedsl_for_ctor_test(tactic_autotune=True)
+    assert moe_on.tactic_autotune is True
+
+
+def test_megamoe_cutedsl_tactic_autotune_threading_and_validation():
+    # ``tactic_autotune`` threads through create_moe_backend into the
+    # MegaMoECuteDsl constructor (mirroring combine_format) and is rejected
+    # for every other backend class.
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+    )
+    moe = create_moe_backend(
+        moe_cls=MegaMoECuteDsl,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        init_load_balancer=False,
+        tactic_autotune=True,
+    )
+    assert moe.tactic_autotune is True
+
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+
+    with pytest.raises(ValueError, match=r"tactic_autotune=True is only supported"):
+        create_moe_backend(
+            moe_cls=CutlassFusedMoE,
+            routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+            num_experts=8,
+            hidden_size=512,
+            intermediate_size=512,
+            dtype=torch.bfloat16,
+            model_config=model_config,
+            init_load_balancer=False,
+            tactic_autotune=True,
+        )
+
+
+def test_enumerate_megamoe_candidate_tactics_curated_space():
+    # Pure-Python enumeration (no cutlass-dsl / GPU needed): the curated
+    # reduced space is the ONLY tuning space -- every candidate passes the
+    # kernel-side legality filter, and epi_flag_batch follows the token
+    # bucket instead of being a scan axis.
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
+    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
+    assert decode and prefill and len(decode) == len(prefill)
+    for tactic in decode + prefill:
+        megamoe_op.validate_megamoe_tactic(tactic)  # raises on an illegal tuple
+    assert {t[-1] for t in decode} == {(1, 1)}
+    assert {t[-1] for t in prefill} == {(2, 4)}
+    # The deterministic fallback stays inside the curated axes for every
+    # bucket regime (it is the tactic an opted-out / untuned run launches).
+    for num_tokens in (64, 4096, 16384):
+        megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
+
+
 def run_backend_moe(
     backend: MoE,
     backend_type: MoeBackendType,
@@ -981,8 +1117,17 @@ def test_moe_backend(
 
         # Autotune phase: tune kernels to find best tactics
         # Use cache_path to speed up subsequent runs by reusing tuning results
-        with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
-            _ = run_moe()
+        # MEGAMOE_CUTEDSL is excluded from tuning mode: its AutoTuner sweep
+        # cute.compile's every curated candidate tactic (a separate
+        # multi-minute JIT each), which unit tests cannot afford; the accuracy
+        # check below covers the deterministic fallback-tactic path (exactly
+        # what a non-tuned serving process runs).
+        if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
+            with torch.inference_mode():
+                _ = run_moe()
+        else:
+            with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
+                _ = run_moe()
 
         # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
         use_flashinfer = getattr(backend, "use_flashinfer", False)
