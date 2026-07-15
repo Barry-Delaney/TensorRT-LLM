@@ -778,9 +778,10 @@ class FusedMoEMethodBase(ABC):
         even when the shard materializes as zero rows on this rank.
         """
         # Debt side keys off module.weight_loading_mode; credit must match.
-        assert weight_loading_mode == module.weight_loading_mode, (
-            f"reload_covered_units mode drift: caller passed "
-            f"{weight_loading_mode}, module has {module.weight_loading_mode}")
+        if weight_loading_mode != module.weight_loading_mode:
+            raise RuntimeError(
+                f"reload_covered_units mode drift: caller passed "
+                f"{weight_loading_mode}, module has {module.weight_loading_mode}")
         if not hasattr(weights, "keys"):
             # Backends pass an unwrapped flat dict despite the List[Dict]
             # contract; normalize.

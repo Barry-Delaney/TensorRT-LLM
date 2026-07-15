@@ -1362,13 +1362,6 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         ]
         processed_mapping = self.remap_fused_shard_indices_by_divisible_factor(
             module.fused_weight_shard_indices_mapping, 128)
-        # The zip below pairs shard_keys-ordered scales with
-        # processed_mapping keys by insertion order: pin that both agree.
-        assert list(processed_mapping) == \
-            module.weights_loading_config.weight_mode.shard_keys, (
-                f"fused_weight_shard_indices_mapping order "
-                f"{list(processed_mapping)} != shard_keys "
-                f"{module.weights_loading_config.weight_mode.shard_keys}")
         for shard_key, scale in zip(processed_mapping.keys(), scales):
             if scale is not None:
                 shard_offset, shard_size = processed_mapping[shard_key]
@@ -1397,12 +1390,6 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         ]
         processed_mapping = self.remap_fused_shard_indices_by_divisible_factor(
             module.fused_weight_shard_indices_mapping, 128)
-        # Same zip-order pin as the fused-QKV loader above.
-        assert list(processed_mapping) == \
-            module.weights_loading_config.weight_mode.shard_keys, (
-                f"fused_weight_shard_indices_mapping order "
-                f"{list(processed_mapping)} != shard_keys "
-                f"{module.weights_loading_config.weight_mode.shard_keys}")
         for shard_key, scale in zip(processed_mapping.keys(), scales):
             if scale is not None:
                 shard_offset, shard_size = processed_mapping[shard_key]

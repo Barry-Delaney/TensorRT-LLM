@@ -1412,8 +1412,9 @@ class DeepseekV4WeightLoader:
                         continue
                     if hasattr(module, "load_weights"):
                         args = inspect.getfullargspec(module.load_weights).args
-                        if "allow_partial_loading" not in args:
-                            assert not allow_partial_loading, (
+                        if ("allow_partial_loading" not in args
+                                and allow_partial_loading):
+                            raise NotImplementedError(
                                 f"allow_partial_loading is not supported for '{name}'"
                             )
                             module.load_weights(weights=[module_weights])
@@ -1424,8 +1425,10 @@ class DeepseekV4WeightLoader:
                             )
                     else:
                         for n, p in module.named_parameters():
-                            if not allow_partial_loading:
-                                assert n in module_weights
+                            if not allow_partial_loading and n not in module_weights:
+                                raise KeyError(
+                                    f"missing weight '{n}' for '{name}' on a "
+                                    f"full (non-partial) load")
                             if n in module_weights:
                                 p.data.copy_(module_weights[n][:])
 
@@ -1785,10 +1788,10 @@ class DeepseekV4Gate(nn.Module):
         w = weights[0].get("weight")
         aux_name = "tid2eid" if self.is_hashed else "e_score_correction_bias"
         aux = weights[0].get(aux_name)
-        if not allow_partial_loading:
-            assert w is not None and aux is not None, (
-                f"DeepseekV4Gate expects 'weight' and '{aux_name}' when partial loading is disabled"
-            )
+        if not allow_partial_loading and (w is None or aux is None):
+            raise ValueError(
+                f"DeepseekV4Gate expects 'weight' and '{aux_name}' when "
+                f"partial loading is disabled")
         if w is not None:
             self.weight.copy_(w[:])
 
