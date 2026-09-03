@@ -556,12 +556,9 @@ class MegaMoECuteDsl(MoEImplBase):
         self.situ_linear_beta = situ_linear_beta
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # topk-score application point. v2 default is the deepgemm graph
-        # (apply_topk_in_fc1=True): the fused kernel folds the topk score into
-        # the SwiGLU output before the fc1-out NVFP4 quant. Kept as an internal
-        # backend constant until the transformers route is GPU-validated and
-        # promoted to MoeConfig.
-        self.apply_topk_in_fc1 = True
+        # Draft K3 experiment: use the transformers graph, which applies the
+        # top-k score after FC2. The production choice should be model-owned.
+        self.apply_topk_in_fc1 = False
 
         # Cross-rank combine wire format is selected with
         # MEGAMOE_COMBINE_FORMAT (default bf16). It MUST be rank-identical:
